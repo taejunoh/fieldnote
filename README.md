@@ -10,12 +10,33 @@ Fieldnote was a personal sports analysis app with a persistent conversation and 
 - [운영 종료 보고서](docs/fieldnote-postmortem.md)
 - [Evidence and reproduction guide](docs/postmortem/README.md)
 
-## How it worked
+## Architecture
 
-- Each sport had one conversation, with original messages stored in Postgres. Markdown imports produced reviewable drafts of evaluation rules, candidates, and historical records.
-- A separate worker assembled context and called Codex web search through the pinned openllms gateway. Jobs remained in the database when the page closed and could be checked again on reload.
-- Publishing a verified analysis required a completed gateway response, completed web search, and source URLs. The app recorded interruptions and verification failures separately from confirmed bets.
-- The preserved application defaults to `gpt-6-astra` with `high` effort for analysis and reevaluation and `medium` for simple status checks. The server settings use the `OPENLLMS_*` environment variables.
+```text
+Next.js + TypeScript UI
+    │ enqueue a research request
+    ▼
+Supabase Postgres ──▶ Background worker ──▶ openllms gateway ──▶ Codex web search
+    ▲                         │
+    │                         └─ save raw response, validate and publish rows
+    └── store confirmed bets separately from recommendations
+```
+
+Each of the eight sports had a persistent conversation. Postgres stored the original messages, analysis rules, jobs, and ledger. Markdown imports created drafts for review. For each request, the worker assembled recent messages, relevant history, and game state. After saving the raw response, it validated the game, market, price, and source references before publishing structured rows.
+
+The preserved app defaults to `gpt-6-astra` with `high` effort for analysis and reevaluation and `medium` for simple status checks. Server settings use the `OPENLLMS_*` environment variables.
+
+## Operating results
+
+- **423 recorded requests** finished with 405 completed, 7 failed, and 11 interrupted. The final failure or interruption rate was 4.26%. Completed jobs could still have missing rows or earlier failed attempts.
+- In a separate seven-sport audit, all seven raw responses were saved, but none initially passed the checks for a structured table. Two lacked an evaluation block, four failed schema validation, and one failed source URL matching.
+- Six bets confirmed directly in Fieldnote went 2–4 on 2.75U risked, for a result-based loss of 0.7891U. The sample was small, and the available ChatGPT records covered different dates, markets, and accepted prices. A matched comparison remains unverified. [Detailed performance by sport](docs/fieldnote-postmortem.en.md#3-analysis-and-bet-performance)
+
+## Why it stopped
+
+Persistent threads reduced the work of moving context between chats. Interrupted requests and missing table rows still sent the user back to the raw answer to verify recommendations and price conditions. The review could establish where results went missing. It had too little comparable data to establish which workflow performed better on confirmed bets.
+
+The useful reliability measure was how often the first request put a complete, usable result in the table. Fieldnote was retired in November 2026. The shutdown included an isolated database restore with matching record counts and a gateway backup verified against the source files. [Hosting shutdown and backup verification](docs/fieldnote-postmortem.en.md#7-hosting-shutdown-and-backup-verification)
 
 ## Local setup
 
