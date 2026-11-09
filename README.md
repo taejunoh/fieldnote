@@ -1,5 +1,7 @@
 # Fieldnote
 
+[한국어 README](README.ko.md)
+
 Fieldnote was a personal sports analysis app with a persistent conversation and betting ledger for each sport. It imported Markdown handoffs, queued research in a background worker, and kept recommendations separate from user-confirmed bets.
 
 **Project status: retired.** The Railway deployments were stopped, the Hobby subscription was canceled, and the Supabase project was paused. On the development Mac, login startup was disabled and the local web app and analysis worker were stopped. This repository preserves the application source and the de-identified evidence behind the postmortem. Verified database and gateway backups are stored separately in restricted local storage.
