@@ -1,0 +1,7 @@
+Source repository: https://github.com/goodtekxyz/openllms
+Source commit: 76945701e6822512ca7370d5583db6822e16eb83
+Source tree: committed files from that commit only; no .git directory, submodule, credentials, or runtime files.
+Archive command: git archive --format=tar 76945701e6822512ca7370d5583db6822e16eb83
+Archive: openllms-76945701e6822512ca7370d5583db6822e16eb83.tar
+SHA-256: 35ea2cab8b31644d09f682a504d2fed71402e66aa689e06b012e2a3709e63768
+Compatibility patch: ../patches/0001-sports-desk-compat.patch (applied by gateway/Dockerfile)

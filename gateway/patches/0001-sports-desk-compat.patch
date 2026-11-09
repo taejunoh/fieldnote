@@ -1,0 +1,3751 @@
+diff --git a/cmd/llms-gateway/main.go b/cmd/llms-gateway/main.go
+index ba3e844..e3cd426 100644
+--- a/cmd/llms-gateway/main.go
++++ b/cmd/llms-gateway/main.go
+@@ -17,6 +17,9 @@ import (
+ )
+ 
+ func main() {
++	if len(os.Args) == 2 && os.Args[1] == "--probe-codex-websocket" {
++		os.Exit(runCodexWebSocketProbe())
++	}
+ 	cfg, err := config.Load()
+ 	if err != nil {
+ 		slog.Error("config", "err", err)
+diff --git a/cmd/llms-gateway/websocket_probe.go b/cmd/llms-gateway/websocket_probe.go
+new file mode 100644
+index 0000000..51b7cb6
+--- /dev/null
++++ b/cmd/llms-gateway/websocket_probe.go
+@@ -0,0 +1,72 @@
++package main
++
++import (
++	"context"
++	"database/sql"
++	"encoding/json"
++	"github.com/goodtekxyz/openllms/internal/config"
++	"github.com/goodtekxyz/openllms/internal/db"
++	"github.com/goodtekxyz/openllms/internal/proxy"
++	secretfile "github.com/goodtekxyz/openllms/internal/secrets/file"
++	"github.com/goodtekxyz/openllms/internal/store"
++	"net/http"
++	"net/url"
++	"os"
++	"strings"
++	"time"
++)
++
++func runCodexWebSocketProbe() int {
++	result := proxy.CodexWebSocketProbe{ErrorCode: "config_error"}
++	cfg, err := config.Load()
++	if err == nil {
++		result = probeStoredCodexAccount(cfg)
++	}
++	json.NewEncoder(os.Stdout).Encode(result)
++	if result.OK {
++		return 0
++	}
++	return 1
++}
++func probeStoredCodexAccount(cfg config.Config) proxy.CodexWebSocketProbe {
++	if !db.IsSQLite(cfg.DatabaseURL) {
++		return proxy.CodexWebSocketProbe{ErrorCode: "unsupported_storage"}
++	}
++	path, err := db.SQLiteFilePath(cfg.DatabaseURL)
++	if err != nil {
++		return proxy.CodexWebSocketProbe{ErrorCode: "storage_error"}
++	}
++	if _, err := os.Stat(path); err != nil {
++		return proxy.CodexWebSocketProbe{ErrorCode: "storage_error"}
++	}
++	// mode=ro avoids migration, journal changes, directory creation, and writes.
++	dsn := (&url.URL{Scheme: "file", Path: path, RawQuery: "mode=ro"}).String()
++	conn, err := sql.Open("sqlite", dsn)
++	if err != nil {
++		return proxy.CodexWebSocketProbe{ErrorCode: "storage_error"}
++	}
++	defer conn.Close()
++	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
++	defer cancel()
++	st := store.NewSQLiteWithCacheTTL(conn, 0, 0)
++	accounts, err := st.ListOAuthAccounts(ctx)
++	if err != nil {
++		return proxy.CodexWebSocketProbe{ErrorCode: "storage_error"}
++	}
++	var selected *store.Account
++	for i := range accounts {
++		if strings.EqualFold(accounts[i].Vendor, "codex") && accounts[i].Health == "ok" {
++			selected = &accounts[i]
++			break
++		}
++	}
++	if selected == nil {
++		return proxy.CodexWebSocketProbe{ErrorCode: "no_eligible_account"}
++	}
++	secret, err := secretfile.New(cfg.SecretsDir)
++	if err != nil {
++		return proxy.CodexWebSocketProbe{ErrorCode: "secrets_error"}
++	}
++	engine := &proxy.Engine{Secrets: secret, HTTP: &http.Client{Timeout: 15 * time.Second}}
++	return engine.CheckCodexWebSocketHandshake(ctx, selected)
++}
+diff --git a/cmd/llms-gateway/websocket_probe_test.go b/cmd/llms-gateway/websocket_probe_test.go
+new file mode 100644
+index 0000000..7f6e475
+--- /dev/null
++++ b/cmd/llms-gateway/websocket_probe_test.go
+@@ -0,0 +1,64 @@
++package main
++
++import (
++	"context"
++	"github.com/goodtekxyz/openllms/internal/config"
++	"github.com/goodtekxyz/openllms/internal/db"
++	"github.com/goodtekxyz/openllms/internal/store"
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++func TestWebSocketProbeExistingReadOnlyStore(t *testing.T) {
++	root := t.TempDir()
++	path := filepath.Join(root, "probe.db")
++	databaseURL := "sqlite://" + path
++	if err := db.Migrate(databaseURL); err != nil {
++		t.Fatal(err)
++	}
++	conn, err := db.ConnectSQLite(context.Background(), databaseURL)
++	if err != nil {
++		t.Fatal(err)
++	}
++	st := store.NewSQLiteWithCacheTTL(conn, 0, 0)
++	projectID, _, err := st.Bootstrap(context.Background(), "local-probe", "local-probe", "local-probe")
++	if err != nil {
++		t.Fatal(err)
++	}
++	// An untrusted target must be rejected without opening/creating the secret vault.
++	_, err = st.CreateAccount(context.Background(), projectID, "codex", "probe", "oauth", "/local/probe", "https://evil.invalid/backend-api/codex")
++	if err != nil {
++		t.Fatal(err)
++	}
++	conn.Close()
++	before, err := os.ReadFile(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	vault := filepath.Join(root, "missing-secrets")
++	result := probeStoredCodexAccount(config.Config{DatabaseURL: databaseURL, SecretsDir: vault})
++	if result.ErrorCode != "unsafe_target" {
++		t.Fatalf("unsafe result: %+v", result)
++	}
++	after, err := os.ReadFile(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if string(before) != string(after) {
++		t.Fatal("probe changed database")
++	}
++	if _, err := os.Stat(vault); !os.IsNotExist(err) {
++		t.Fatal("probe created vault")
++	}
++}
++func TestWebSocketProbeNeverCreatesMissingStore(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "missing.db")
++	result := probeStoredCodexAccount(config.Config{DatabaseURL: "sqlite://" + path})
++	if result.ErrorCode != "storage_error" {
++		t.Fatal("missing store accepted")
++	}
++	if _, err := os.Stat(path); !os.IsNotExist(err) {
++		t.Fatal("probe created store")
++	}
++}
+diff --git a/go.mod b/go.mod
+index 70d1678..bba023a 100644
+--- a/go.mod
++++ b/go.mod
+@@ -4,6 +4,7 @@ go 1.24.0
+ 
+ require (
+ 	github.com/charmbracelet/huh v1.0.0
++	github.com/coder/websocket v1.8.14
+ 	github.com/go-chi/chi/v5 v5.2.2
+ 	github.com/golang-migrate/migrate/v4 v4.18.3
+ 	github.com/google/uuid v1.6.0
+diff --git a/go.sum b/go.sum
+index 90a307d..9a6e761 100644
+--- a/go.sum
++++ b/go.sum
+@@ -40,6 +40,8 @@ github.com/charmbracelet/x/termios v0.1.1 h1:o3Q2bT8eqzGnGPOYheoYS8eEleT5ZVNYNy8
+ github.com/charmbracelet/x/termios v0.1.1/go.mod h1:rB7fnv1TgOPOyyKRJ9o+AsTU/vK5WHJ2ivHeut/Pcwo=
+ github.com/charmbracelet/x/xpty v0.1.2 h1:Pqmu4TEJ8KeA9uSkISKMU3f+C1F6OGBn8ABuGlqCbtI=
+ github.com/charmbracelet/x/xpty v0.1.2/go.mod h1:XK2Z0id5rtLWcpeNiMYBccNNBrP2IJnzHI0Lq13Xzq4=
++github.com/coder/websocket v1.8.14 h1:9L0p0iKiNOibykf283eHkKUHHrpG7f65OE3BhhO7v9g=
++github.com/coder/websocket v1.8.14/go.mod h1:NX3SzP+inril6yawo5CQXx8+fk145lPDC6pumgx0mVg=
+ github.com/cpuguy83/go-md2man/v2 v2.0.6/go.mod h1:oOW0eioCTA6cOiMLiUPZOpcVxMig6NIQQ7OS05n1F4g=
+ github.com/creack/pty v1.1.24 h1:bJrF4RRfyJnbTJqzRLHzcGaZK1NeM5kTC9jGgovnR1s=
+ github.com/creack/pty v1.1.24/go.mod h1:08sCNb52WyoAwi2QDyzUCTgcvVFhUzewun7wtTfvcwE=
+diff --git a/internal/config/config.go b/internal/config/config.go
+index c2d302c..8231688 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -3,14 +3,17 @@ package config
+ import (
+ 	"fmt"
+ 	"os"
++	"strconv"
+ 	"strings"
+ 	"time"
+ )
+ 
+ // Config is runtime configuration for llms-gateway (D-007).
+ type Config struct {
+-	HTTPAddr    string
+-	DatabaseURL string
++	UpstreamTimeout time.Duration
++	CodexTransport  string
++	HTTPAddr        string
++	DatabaseURL     string
+ 
+ 	BootstrapToken string
+ 
+@@ -38,12 +41,12 @@ type Config struct {
+ 	AdminCookieSecure  bool
+ 
+ 	// Signup notification email → hello@goodtek.xyz (Resend or SMTP).
+-	ResendAPIKey   string
+-	SMTPHost       string
+-	SMTPPort       string
+-	SMTPUser       string
+-	SMTPPass       string
+-	NotifyEmailTo  string
++	ResendAPIKey    string
++	SMTPHost        string
++	SMTPPort        string
++	SMTPUser        string
++	SMTPPass        string
++	NotifyEmailTo   string
+ 	NotifyEmailFrom string
+ 
+ 	// Public site URL (prod or https://dev-llms.goodtek.xyz).
+@@ -54,10 +57,10 @@ type Config struct {
+ 	DistDir string
+ 
+ 	// Billing — Polar (card) + Unifi Pay (crypto).
+-	BillingMock    bool
+-	BillingEnforce bool // when true, create account/route/key requires entitlement
+-	Polar          billingPolar
+-	Unifi          billingUnifi
++	BillingMock               bool
++	BillingEnforce            bool // when true, create account/route/key requires entitlement
++	Polar                     billingPolar
++	Unifi                     billingUnifi
+ 	BillingCheckoutSuccessURL string
+ 	BillingCheckoutCancelURL  string
+ 	BillingPortalReturnURL    string
+@@ -85,7 +88,21 @@ type billingUnifi struct {
+ }
+ 
+ func Load() (Config, error) {
++	transport := envOr("OPENLLMS_CODEX_TRANSPORT", "http")
++	if transport != "http" && transport != "ws" {
++		return Config{}, fmt.Errorf("OPENLLMS_CODEX_TRANSPORT must be http or ws")
++	}
++	timeoutSeconds := 2700
++	if raw := os.Getenv("OPENLLMS_UPSTREAM_TIMEOUT_SECONDS"); raw != "" {
++		parsed, err := strconv.Atoi(raw)
++		if err != nil || parsed < 60 || parsed > 3600 {
++			return Config{}, fmt.Errorf("OPENLLMS_UPSTREAM_TIMEOUT_SECONDS must be an integer from 60 to 3600")
++		}
++		timeoutSeconds = parsed
++	}
+ 	cfg := Config{
++		UpstreamTimeout:       time.Duration(timeoutSeconds) * time.Second,
++		CodexTransport:        transport,
+ 		HTTPAddr:              envOr("HTTP_ADDR", ":8080"),
+ 		DatabaseURL:           os.Getenv("DATABASE_URL"),
+ 		BootstrapToken:        os.Getenv("BOOTSTRAP_TOKEN"),
+@@ -113,8 +130,8 @@ func Load() (Config, error) {
+ 		NotifyEmailFrom:       envOr("NOTIFY_EMAIL_FROM", "llms@goodtek.xyz"),
+ 		PublicBaseURL:         strings.TrimRight(envOr("PUBLIC_BASE_URL", "https://llms.goodtek.xyz"), "/"),
+ 		DistDir:               strings.TrimSpace(os.Getenv("LLMS_DIST_DIR")),
+-		BillingMock:    os.Getenv("BILLING_MOCK") == "true" || os.Getenv("BILLING_MOCK") == "1",
+-		BillingEnforce: os.Getenv("BILLING_ENFORCE") == "true" || os.Getenv("BILLING_ENFORCE") == "1",
++		BillingMock:           os.Getenv("BILLING_MOCK") == "true" || os.Getenv("BILLING_MOCK") == "1",
++		BillingEnforce:        os.Getenv("BILLING_ENFORCE") == "true" || os.Getenv("BILLING_ENFORCE") == "1",
+ 		Polar: billingPolar{
+ 			APIBase:        "", // set below from POLAR_API_BASE_URL or prod/sandbox default
+ 			AccessToken:    os.Getenv("POLAR_ORGANIZATION_ACCESS_TOKEN"),
+diff --git a/internal/httpserver/diagnostics.go b/internal/httpserver/diagnostics.go
+new file mode 100644
+index 0000000..6288463
+--- /dev/null
++++ b/internal/httpserver/diagnostics.go
+@@ -0,0 +1,178 @@
++package httpserver
++
++import (
++	"errors"
++	"log/slog"
++	"net/http"
++	"os"
++	"regexp"
++	"strings"
++	"time"
++
++	"github.com/google/uuid"
++)
++
++const (
++	headerJobID             = "X-SportsDesk-Job-Id"
++	headerAttemptID         = "X-SportsDesk-Attempt-Id"
++	headerTransportAttempt  = "X-SportsDesk-Transport-Attempt"
++	headerRequestID         = "X-SportsDesk-Request-Id"
++	headerGatewayRequestID  = "X-SportsDesk-Gateway-Request-Id"
++	headerUpstreamTransport = "X-SportsDesk-Upstream-Transport"
++	headerRecoveryAccountID = "X-SportsDesk-Recovery-Account-Id"
++)
++
++var buildIDPattern = regexp.MustCompile(`^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$`)
++
++var gatewayInstanceID = uuid.NewString()
++
++func parseCodexHTTPRecovery(r *http.Request, configuredTransport string) (uuid.UUID, bool, bool) {
++	transportValues := r.Header.Values(headerUpstreamTransport)
++	accountValues := r.Header.Values(headerRecoveryAccountID)
++	if len(transportValues) == 0 && len(accountValues) == 0 {
++		return uuid.Nil, false, true
++	}
++	attemptValues := r.Header.Values(headerTransportAttempt)
++	if len(transportValues) != 1 || len(accountValues) != 1 || len(attemptValues) != 1 || transportValues[0] != "http" || configuredTransport != "ws" || attemptValues[0] != "2" {
++		return uuid.Nil, false, false
++	}
++	for _, name := range []string{headerJobID, headerAttemptID, headerRequestID} {
++		values := r.Header.Values(name)
++		if len(values) != 1 {
++			return uuid.Nil, false, false
++		}
++		id, err := uuid.Parse(values[0])
++		if err != nil || strings.ToLower(values[0]) != id.String() {
++			return uuid.Nil, false, false
++		}
++	}
++	accountID, err := uuid.Parse(accountValues[0])
++	if err != nil || accountID == uuid.Nil || strings.ToLower(accountValues[0]) != accountID.String() {
++		return uuid.Nil, false, false
++	}
++	return accountID, true, true
++}
++
++type gatewayResponseWriter struct {
++	http.ResponseWriter
++	status          int
++	writeFailed     bool
++	deliveryUnknown bool
++}
++
++func (w *gatewayResponseWriter) WriteHeader(status int) {
++	if w.status != 0 {
++		return
++	}
++	w.status = status
++	w.ResponseWriter.WriteHeader(status)
++}
++
++func (w *gatewayResponseWriter) Write(p []byte) (int, error) {
++	if w.status == 0 {
++		w.WriteHeader(http.StatusOK)
++	}
++	n, err := w.ResponseWriter.Write(p)
++	if err != nil {
++		w.writeFailed = true
++	}
++	return n, err
++}
++
++type gatewayFlushWriter struct {
++	*gatewayResponseWriter
++}
++
++func (w *gatewayFlushWriter) Flush() {
++	_ = w.FlushError()
++}
++
++func (w *gatewayResponseWriter) outputWriter() http.ResponseWriter {
++	if _, ok := w.ResponseWriter.(http.Flusher); ok {
++		return &gatewayFlushWriter{gatewayResponseWriter: w}
++	}
++	if _, ok := w.ResponseWriter.(interface{ FlushError() error }); ok {
++		return &gatewayFlushWriter{gatewayResponseWriter: w}
++	}
++	return w
++}
++
++func (w *gatewayResponseWriter) FlushError() error {
++	return w.flush()
++}
++
++func (w *gatewayResponseWriter) flush() error {
++	if w.status == 0 {
++		w.WriteHeader(http.StatusOK)
++	}
++	err := http.NewResponseController(w.ResponseWriter).Flush()
++	if errors.Is(err, http.ErrNotSupported) {
++		w.deliveryUnknown = true
++		return err
++	}
++	if err != nil {
++		w.writeFailed = true
++	}
++	return err
++}
++
++func (w *gatewayResponseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
++
++func gatewayLifecycleAttrs(r *http.Request, requestID string, stage string, status int, elapsedMS int64, outcome string) []any {
++	attrs := []any{"event", "gateway_request_" + stage, "gateway_request_id", requestID, "gateway_instance_id", gatewayInstanceID, "stage", stage, "http_status", status, "elapsed_ms", elapsedMS}
++	if build := os.Getenv("RAILWAY_GIT_COMMIT_SHA"); buildIDPattern.MatchString(build) {
++		attrs = append(attrs, "gateway_build_id", build)
++	} else if id, err := uuid.Parse(os.Getenv("RAILWAY_DEPLOYMENT_ID")); err == nil {
++		attrs = append(attrs, "gateway_build_id", id.String())
++	} else {
++		attrs = append(attrs, "gateway_build_id", "unknown")
++	}
++	for _, header := range []struct{ name, key string }{
++		{headerJobID, "job_id"}, {headerAttemptID, "attempt_id"}, {headerRequestID, "request_id"},
++	} {
++		if id, err := uuid.Parse(r.Header.Get(header.name)); err == nil {
++			attrs = append(attrs, header.key, id.String())
++		}
++	}
++	if attempt := r.Header.Get(headerTransportAttempt); attempt == "1" || attempt == "2" {
++		attrs = append(attrs, "transport_attempt", attempt)
++	}
++	if outcome != "" {
++		attrs = append(attrs, "downstream_delivery_outcome", outcome)
++	}
++	return attrs
++}
++
++func beginGatewayLifecycle(w http.ResponseWriter, r *http.Request) (*gatewayResponseWriter, string, time.Time) {
++	requestID := uuid.NewString()
++	w.Header().Set(headerGatewayRequestID, requestID)
++	wrapped := &gatewayResponseWriter{ResponseWriter: w}
++	started := time.Now()
++	slog.Info("gateway request started", gatewayLifecycleAttrs(r, requestID, "started", 0, 0, "")...)
++	return wrapped, requestID, started
++}
++
++func logGatewayRequestRejected(r *http.Request, requestID string, stage string, status int) {
++	attrs := gatewayLifecycleAttrs(r, requestID, stage, status, 0, "")
++	attrs[1] = "gateway_request_rejected"
++	attrs = append(attrs, "upstream_call", false)
++	slog.Info("gateway request rejected", attrs...)
++}
++
++func endGatewayLifecycle(w *gatewayResponseWriter, r *http.Request, requestID string, started time.Time) {
++	status := w.status
++	if status == 0 {
++		status = http.StatusOK
++	}
++	outcome := "completed"
++	if w.writeFailed {
++		outcome = "write_failed"
++	} else if w.deliveryUnknown {
++		outcome = "unknown"
++	}
++	attrs := gatewayLifecycleAttrs(r, requestID, "ended", status, time.Since(started).Milliseconds(), outcome)
++	if w.writeFailed && r.Context().Err() != nil {
++		attrs = append(attrs, "cancellation_origin", "unknown")
++	}
++	slog.Info("gateway request ended", attrs...)
++}
+diff --git a/internal/httpserver/diagnostics_test.go b/internal/httpserver/diagnostics_test.go
+new file mode 100644
+index 0000000..36495eb
+--- /dev/null
++++ b/internal/httpserver/diagnostics_test.go
+@@ -0,0 +1,119 @@
++package httpserver
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"log/slog"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++)
++
++type failingDiagnosticWriter struct {
++	header http.Header
++}
++
++func (w *failingDiagnosticWriter) Header() http.Header { return w.header }
++func (w *failingDiagnosticWriter) WriteHeader(int)     {}
++func (w *failingDiagnosticWriter) Write([]byte) (int, error) {
++	return 0, errors.New("private downstream body")
++}
++
++func TestGatewayLifecycleSeparatesWriteFailureFromCancellation(t *testing.T) {
++	var logs bytes.Buffer
++	previous := slog.Default()
++	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
++	t.Cleanup(func() { slog.SetDefault(previous) })
++
++	ctx, cancel := context.WithCancel(context.Background())
++	r := httptest.NewRequest(http.MethodPost, "/r/private-route/v1/chat/completions", nil).WithContext(ctx)
++	r.Header.Set(headerJobID, "123e4567-e89b-12d3-a456-426614174000")
++	w, id, started := beginGatewayLifecycle(&failingDiagnosticWriter{header: make(http.Header)}, r)
++	cancel()
++	_, _ = w.Write([]byte("private downstream body"))
++	endGatewayLifecycle(w, r, id, started.Add(-time.Millisecond))
++	if !strings.Contains(logs.String(), `"downstream_delivery_outcome":"write_failed"`) || !strings.Contains(logs.String(), `"cancellation_origin":"unknown"`) || strings.Contains(logs.String(), "private downstream body") || strings.Contains(logs.String(), "private-route") {
++		t.Fatal("write failure lifecycle log was incomplete or included request data")
++	}
++}
++
++func TestCompletedGatewayWriteIsNotRelabeledByReaderCancellation(t *testing.T) {
++	var logs bytes.Buffer
++	previous := slog.Default()
++	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
++	t.Cleanup(func() { slog.SetDefault(previous) })
++
++	ctx, cancel := context.WithCancel(context.Background())
++	r := httptest.NewRequest(http.MethodPost, "/r/route/v1/chat/completions", nil).WithContext(ctx)
++	w := httptest.NewRecorder()
++	tracked, id, started := beginGatewayLifecycle(w, r)
++	if _, err := tracked.Write([]byte("ok")); err != nil {
++		t.Fatal(err)
++	}
++	cancel()
++	endGatewayLifecycle(tracked, r, id, started)
++	if !strings.Contains(logs.String(), `"downstream_delivery_outcome":"completed"`) || strings.Contains(logs.String(), `"downstream_delivery_outcome":"cancelled"`) {
++		t.Fatal("successful delivery was mislabeled after reader cancellation")
++	}
++}
++
++type noFlushDiagnosticWriter struct {
++	header http.Header
++}
++
++func (w *noFlushDiagnosticWriter) Header() http.Header         { return w.header }
++func (w *noFlushDiagnosticWriter) WriteHeader(int)             {}
++func (w *noFlushDiagnosticWriter) Write(p []byte) (int, error) { return len(p), nil }
++
++type flushErrorDiagnosticWriter struct {
++	header http.Header
++}
++
++func (w *flushErrorDiagnosticWriter) Header() http.Header         { return w.header }
++func (w *flushErrorDiagnosticWriter) WriteHeader(int)             {}
++func (w *flushErrorDiagnosticWriter) Write(p []byte) (int, error) { return len(p), nil }
++func (w *flushErrorDiagnosticWriter) FlushError() error           { return errors.New("private flush failure") }
++
++func TestGatewayLifecycleRecordsUnderlyingFlushError(t *testing.T) {
++	var logs bytes.Buffer
++	previous := slog.Default()
++	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
++	t.Cleanup(func() { slog.SetDefault(previous) })
++
++	r := httptest.NewRequest(http.MethodPost, "/r/route/v1/chat/completions", nil)
++	writer := &flushErrorDiagnosticWriter{header: make(http.Header)}
++	tracked, id, started := beginGatewayLifecycle(writer, r)
++	if _, err := tracked.Write([]byte("ok")); err != nil {
++		t.Fatal(err)
++	}
++	tracked.outputWriter().(http.Flusher).Flush()
++	endGatewayLifecycle(tracked, r, id, started)
++	if !strings.Contains(logs.String(), `"downstream_delivery_outcome":"write_failed"`) || strings.Contains(logs.String(), "private flush failure") {
++		t.Fatal("underlying flush failure was not safely recorded")
++	}
++}
++
++func TestGatewayLifecycleMarksUnsupportedFlushAsUnknown(t *testing.T) {
++	var logs bytes.Buffer
++	previous := slog.Default()
++	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
++	t.Cleanup(func() { slog.SetDefault(previous) })
++
++	r := httptest.NewRequest(http.MethodPost, "/r/route/v1/chat/completions", nil)
++	writer := &noFlushDiagnosticWriter{header: make(http.Header)}
++	tracked, id, started := beginGatewayLifecycle(writer, r)
++	_, _ = tracked.Write([]byte("ok"))
++	if _, ok := tracked.outputWriter().(http.Flusher); ok {
++		t.Fatal("unsupported underlying writer was exposed as an optional Flusher")
++	}
++	if err := http.NewResponseController(tracked.outputWriter()).Flush(); !errors.Is(err, http.ErrNotSupported) {
++		t.Fatalf("expected unsupported flush, got %v", err)
++	}
++	endGatewayLifecycle(tracked, r, id, started)
++	if !strings.Contains(logs.String(), `"downstream_delivery_outcome":"unknown"`) || strings.Contains(logs.String(), `"downstream_delivery_outcome":"completed"`) {
++		t.Fatal("unsupported flush was incorrectly reported as completed")
++	}
++}
+diff --git a/internal/httpserver/new_default.go b/internal/httpserver/new_default.go
+index 0a57b1e..91bd181 100644
+--- a/internal/httpserver/new_default.go
++++ b/internal/httpserver/new_default.go
+@@ -17,6 +17,10 @@ import (
+ 
+ // New constructs the OSS gateway server (no Cloud overlay).
+ func New(st *store.Store, cfg config.Config, secret secrets.Client) *Server {
++	timeout := cfg.UpstreamTimeout
++	if timeout == 0 {
++		timeout = 45 * time.Minute
++	}
+ 	userSecret := cfg.BillingSessionSecret
+ 	if userSecret == "" {
+ 		userSecret = cfg.AdminSessionSecret
+@@ -30,7 +34,7 @@ func New(st *store.Store, cfg config.Config, secret secrets.Client) *Server {
+ 		cfg:           cfg,
+ 		store:         st,
+ 		secret:        secret,
+-		proxy:         &proxy.Engine{Store: st, Secrets: secret, HTTP: &http.Client{Timeout: 120 * time.Second}},
++		proxy:         &proxy.Engine{Store: st, Secrets: secret, HTTP: &http.Client{Timeout: timeout}, CodexTransport: cfg.CodexTransport},
+ 		limit:         ratelimit.NewMemory(cfg.RateLimitPerMin, time.Minute),
+ 		models:        modelcatalog.New(secret, &http.Client{Timeout: 12 * time.Second}, modelcatalog.DefaultCacheTTL),
+ 		admin:         disabledAdmin{},
+diff --git a/internal/httpserver/oss_e2e_test.go b/internal/httpserver/oss_e2e_test.go
+index 739d253..c1b268e 100644
+--- a/internal/httpserver/oss_e2e_test.go
++++ b/internal/httpserver/oss_e2e_test.go
+@@ -4,10 +4,14 @@ import (
+ 	"bytes"
+ 	"context"
+ 	"encoding/json"
++	"github.com/google/uuid"
+ 	"io"
++	"log/slog"
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"path/filepath"
++	"strings"
++	"sync/atomic"
+ 	"testing"
+ 
+ 	"github.com/goodtekxyz/openllms/internal/config"
+@@ -21,6 +25,10 @@ import (
+ // SQLite + file vault → bootstrap → account → route → attach → chat completions.
+ func TestOSSE2E_SQLiteFileSecrets_MockUpstream(t *testing.T) {
+ 	dir := t.TempDir()
++	var logBuffer bytes.Buffer
++	previousLogger := slog.Default()
++	slog.SetDefault(slog.New(slog.NewJSONHandler(&logBuffer, nil)))
++	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+ 	dbURL := "sqlite:" + filepath.Join(dir, "llms.db")
+ 	if err := db.Migrate(dbURL); err != nil {
+ 		t.Fatalf("migrate: %v", err)
+@@ -36,7 +44,13 @@ func TestOSSE2E_SQLiteFileSecrets_MockUpstream(t *testing.T) {
+ 		t.Fatalf("file secrets: %v", err)
+ 	}
+ 
++	var upstreamCalls atomic.Int32
++	var forwardedInternalHeader atomic.Bool
+ 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		upstreamCalls.Add(1)
++		if r.Header.Get("X-SportsDesk-Job-Id") != "" || r.Header.Get("X-SportsDesk-Request-Id") != "" {
++			forwardedInternalHeader.Store(true)
++		}
+ 		if r.URL.Path != "/v1/chat/completions" {
+ 			http.NotFound(w, r)
+ 			return
+@@ -57,7 +71,7 @@ func TestOSSE2E_SQLiteFileSecrets_MockUpstream(t *testing.T) {
+ 	t.Cleanup(up.Close)
+ 
+ 	st := store.NewSQLite(sqlDB)
+-	cfg := config.Config{BootstrapToken: "oss-bootstrap"}
++	cfg := config.Config{BootstrapToken: "oss-bootstrap", CodexTransport: "ws"}
+ 	srv := httpserver.New(st, cfg, sec)
+ 	gw := httptest.NewServer(srv.Router())
+ 	t.Cleanup(gw.Close)
+@@ -113,6 +127,60 @@ func TestOSSE2E_SQLiteFileSecrets_MockUpstream(t *testing.T) {
+ 	if patched["preset"] != "balance" {
+ 		t.Fatalf("preset want balance got %v", patched["preset"])
+ 	}
++	for _, tc := range []struct {
++		name             string
++		transport        string
++		attempt          string
++		job              bool
++		account          string
++		noAccount        bool
++		noTransport      bool
++		duplicateAttempt bool
++		want             int
++	}{
++		{name: "unsupported transport", transport: "https", attempt: "2", job: true, account: accountID, want: http.StatusBadRequest},
++		{name: "first ordinal", transport: "http", attempt: "1", job: true, account: accountID, want: http.StatusBadRequest},
++		{name: "missing correlation", transport: "http", attempt: "2", account: accountID, want: http.StatusBadRequest},
++		{name: "missing recovery account", transport: "http", attempt: "2", job: true, noAccount: true, want: http.StatusBadRequest},
++		{name: "missing transport", attempt: "2", job: true, account: accountID, noTransport: true, want: http.StatusBadRequest},
++		{name: "invalid recovery account", transport: "http", attempt: "2", job: true, account: "not-a-uuid", want: http.StatusBadRequest},
++		{name: "zero recovery account", transport: "http", attempt: "2", job: true, account: uuid.Nil.String(), want: http.StatusBadRequest},
++		{name: "duplicate attempt ordinal", transport: "http", attempt: "2", job: true, account: accountID, duplicateAttempt: true, want: http.StatusBadRequest},
++		{name: "ineligible account", transport: "http", attempt: "2", job: true, account: accountID, want: http.StatusConflict},
++	} {
++		t.Run("recovery_"+tc.name, func(t *testing.T) {
++			req, err := http.NewRequest(http.MethodPost, gw.URL+"/r/default/v1/chat/completions", bytes.NewBufferString(`{"model":"gpt-4o-mini","messages":[{"role":"user","content":"test"}]}`))
++			if err != nil {
++				t.Fatal(err)
++			}
++			req.Header.Set("Authorization", auth)
++			req.Header.Set("Content-Type", "application/json")
++			if !tc.noTransport {
++				req.Header.Set("X-SportsDesk-Upstream-Transport", tc.transport)
++			}
++			if !tc.noAccount {
++				req.Header.Set("X-SportsDesk-Recovery-Account-Id", tc.account)
++			}
++			req.Header.Set("X-SportsDesk-Transport-Attempt", tc.attempt)
++			if tc.duplicateAttempt {
++				req.Header.Add("X-SportsDesk-Transport-Attempt", "1")
++			}
++			if tc.job {
++				req.Header.Set("X-SportsDesk-Job-Id", uuid.NewString())
++				req.Header.Set("X-SportsDesk-Attempt-Id", uuid.NewString())
++				req.Header.Set("X-SportsDesk-Request-Id", uuid.NewString())
++			}
++			resp, err := http.DefaultClient.Do(req)
++			if err != nil {
++				t.Fatal(err)
++			}
++			io.Copy(io.Discard, resp.Body)
++			resp.Body.Close()
++			if resp.StatusCode != tc.want || upstreamCalls.Load() != 0 {
++				t.Fatalf("recovery %q status=%d upstream_calls=%d want=%d", tc.name, resp.StatusCode, upstreamCalls.Load(), tc.want)
++			}
++		})
++	}
+ 
+ 	var listed map[string]any
+ 	status = doJSON(t, http.MethodGet, gw.URL+"/control/v1/routes", "", auth, nil, &listed)
+@@ -120,6 +188,29 @@ func TestOSSE2E_SQLiteFileSecrets_MockUpstream(t *testing.T) {
+ 		t.Fatalf("list routes status=%d body=%v", status, listed)
+ 	}
+ 
++	badReq, err := http.NewRequest(http.MethodPost, gw.URL+"/r/default/v1/chat/completions", bytes.NewBufferString(`{"messages":[{"content":"private-prompt-marker"},`))
++	if err != nil {
++		t.Fatal(err)
++	}
++	badReq.Header.Set("Authorization", auth)
++	badReq.Header.Set("Content-Type", "application/json")
++	badReq.Header.Set("X-SportsDesk-Job-Id", uuid.NewString())
++	badReq.Header.Set("X-SportsDesk-Attempt-Id", uuid.NewString())
++	badReq.Header.Set("X-SportsDesk-Transport-Attempt", "1")
++	badReq.Header.Set("X-SportsDesk-Request-Id", uuid.NewString())
++	badResp, err := http.DefaultClient.Do(badReq)
++	if err != nil {
++		t.Fatal(err)
++	}
++	io.Copy(io.Discard, badResp.Body)
++	badResp.Body.Close()
++	if badResp.StatusCode != http.StatusBadRequest || uuid.Validate(badResp.Header.Get("X-SportsDesk-Gateway-Request-Id")) != nil || upstreamCalls.Load() != 0 {
++		t.Fatalf("malformed JSON was not safely rejected before dispatch: status=%d gateway_request_id_valid=%t upstream_calls=%d", badResp.StatusCode, uuid.Validate(badResp.Header.Get("X-SportsDesk-Gateway-Request-Id")) == nil, upstreamCalls.Load())
++	}
++	if !strings.Contains(logBuffer.String(), `"event":"gateway_request_rejected"`) || !strings.Contains(logBuffer.String(), `"stage":"json_decode"`) || !strings.Contains(logBuffer.String(), `"upstream_call":false`) || strings.Contains(logBuffer.String(), "private-prompt-marker") {
++		t.Fatalf("lifecycle log checks event=%t stage=%t upstream=%t leaked=%t", strings.Contains(logBuffer.String(), `"event":"gateway_request_rejected"`), strings.Contains(logBuffer.String(), `"stage":"json_decode"`), strings.Contains(logBuffer.String(), `"upstream_call":false`), strings.Contains(logBuffer.String(), "private-prompt-marker"))
++	}
++
+ 	chatReq := map[string]any{
+ 		"model":    "gpt-4o-mini",
+ 		"messages": []map[string]string{{"role": "user", "content": "ping"}},
+@@ -140,6 +231,12 @@ func TestOSSE2E_SQLiteFileSecrets_MockUpstream(t *testing.T) {
+ 	if resp.StatusCode != http.StatusOK {
+ 		t.Fatalf("chat status=%d body=%s", resp.StatusCode, body)
+ 	}
++	if resp.Header.Get("X-LLMs-Account-Id") != accountID {
++		t.Fatalf("selected-account response hint missing or changed: valid_uuid=%t", uuid.Validate(resp.Header.Get("X-LLMs-Account-Id")) == nil)
++	}
++	if upstreamCalls.Load() != 1 || forwardedInternalHeader.Load() {
++		t.Fatalf("upstream internal headers/call count: calls=%d forwarded=%t", upstreamCalls.Load(), forwardedInternalHeader.Load())
++	}
+ 	if !bytes.Contains(body, []byte("oss-ok")) {
+ 		t.Fatalf("unexpected chat body: %s", body)
+ 	}
+diff --git a/internal/httpserver/server.go b/internal/httpserver/server.go
+index 41ff132..f3acfc0 100644
+--- a/internal/httpserver/server.go
++++ b/internal/httpserver/server.go
+@@ -27,16 +27,16 @@ import (
+ )
+ 
+ type Server struct {
+-		cfg            config.Config
+-	store          *store.Store
+-	secret         secrets.Client
+-	proxy          *proxy.Engine
+-	limit          *ratelimit.MemoryLimiter
+-	models         *modelcatalog.Discoverer
+-	admin          AdminAuth
+-	user           *userauth.Manager
+-	mailer         Mailer
+-	vendorPending  *vendorPendingStore
++	cfg           config.Config
++	store         *store.Store
++	secret        secrets.Client
++	proxy         *proxy.Engine
++	limit         *ratelimit.MemoryLimiter
++	models        *modelcatalog.Discoverer
++	admin         AdminAuth
++	user          *userauth.Manager
++	mailer        Mailer
++	vendorPending *vendorPendingStore
+ }
+ 
+ func (s *Server) Router() http.Handler {
+@@ -981,6 +981,9 @@ const (
+ )
+ 
+ func (s *Server) handleUpstream(w http.ResponseWriter, r *http.Request, kind upstreamKind) {
++	trackedWriter, gatewayRequestID, requestStarted := beginGatewayLifecycle(w, r)
++	w = trackedWriter.outputWriter()
++	defer func() { endGatewayLifecycle(trackedWriter, r, gatewayRequestID, requestStarted) }()
+ 	ac, ok := authn.FromContext(r.Context())
+ 	if !ok {
+ 		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+@@ -1033,15 +1036,34 @@ func (s *Server) handleUpstream(w http.ResponseWriter, r *http.Request, kind ups
+ 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad body"})
+ 		return
+ 	}
++	if !json.Valid(body) {
++		logGatewayRequestRejected(r, gatewayRequestID, "json_decode", http.StatusBadRequest)
++		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON request"})
++		return
++	}
++	recoveryAccountID, recovery, validRecovery := parseCodexHTTPRecovery(r, s.proxy.CodexTransport)
++	if !validRecovery || (recovery && kind != upstreamChat) {
++		logGatewayRequestRejected(r, gatewayRequestID, "invalid_transport_recovery", http.StatusBadRequest)
++		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_transport_recovery"})
++		return
++	}
+ 	var res *proxy.Result
+-	meta := proxy.DispatchMeta{Header: r.Header, SessionKey: proxy.SessionKey(r.Header, body)}
++	dispatchCtx := proxy.WithGatewayRequestID(r.Context(), gatewayRequestID)
++	if recovery {
++		dispatchCtx = proxy.WithCodexHTTPRecovery(dispatchCtx, recoveryAccountID)
++	}
++	forwardHeaders := r.Header.Clone()
++	for _, name := range []string{headerJobID, headerAttemptID, headerTransportAttempt, headerRequestID, headerGatewayRequestID, headerUpstreamTransport, headerRecoveryAccountID} {
++		forwardHeaders.Del(name)
++	}
++	meta := proxy.DispatchMeta{Header: forwardHeaders, SessionKey: proxy.SessionKey(r.Header, body)}
+ 	switch kind {
+ 	case upstreamAnthropic:
+-		res, err = s.proxy.AnthropicMessages(r.Context(), rt, body, meta)
++		res, err = s.proxy.AnthropicMessages(dispatchCtx, rt, body, meta)
+ 	case upstreamImages:
+-		res, err = s.proxy.ImagesGenerations(r.Context(), ac.ProjectID, rt, body, meta)
++		res, err = s.proxy.ImagesGenerations(dispatchCtx, ac.ProjectID, rt, body, meta)
+ 	default:
+-		res, err = s.proxy.ChatCompletions(r.Context(), ac.ProjectID, rt, body, meta)
++		res, err = s.proxy.ChatCompletions(dispatchCtx, ac.ProjectID, rt, body, meta)
+ 	}
+ 	if err != nil && res == nil {
+ 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
+diff --git a/internal/httpserver/timeout_test.go b/internal/httpserver/timeout_test.go
+new file mode 100644
+index 0000000..39cbf6e
+--- /dev/null
++++ b/internal/httpserver/timeout_test.go
+@@ -0,0 +1,16 @@
++package httpserver
++
++import (
++	"testing"
++	"time"
++
++	"github.com/goodtekxyz/openllms/internal/config"
++	"github.com/goodtekxyz/openllms/internal/store"
++)
++
++func TestNewUsesBoundedLongRunningUpstreamTimeout(t *testing.T) {
++	server := New(&store.Store{}, config.Config{}, nil)
++	if got, want := server.proxy.HTTP.Timeout, 45*time.Minute; got != want {
++		t.Fatalf("upstream HTTP timeout = %s, want %s", got, want)
++	}
++}
+diff --git a/internal/httpserver/upstream_config_test.go b/internal/httpserver/upstream_config_test.go
+new file mode 100644
+index 0000000..6c250ad
+--- /dev/null
++++ b/internal/httpserver/upstream_config_test.go
+@@ -0,0 +1,59 @@
++package httpserver
++
++import (
++	"github.com/goodtekxyz/openllms/internal/config"
++	"github.com/goodtekxyz/openllms/internal/store"
++	"testing"
++	"time"
++)
++
++func TestSportsDeskUpstreamTimeoutConfiguration(t *testing.T) {
++	t.Setenv("DATABASE_URL", "sqlite:///tmp/config-only.db")
++	for _, tc := range []struct {
++		raw     string
++		seconds int
++		invalid bool
++	}{
++		{"", 2700, false}, {"60", 60, false}, {"3600", 3600, false}, {"59", 0, true}, {"3601", 0, true}, {"0", 0, true}, {"-1", 0, true}, {"2700junk", 0, true}, {"secret-invalid", 0, true}, {" 60", 0, true},
++	} {
++		t.Run(tc.raw, func(t *testing.T) {
++			t.Setenv("OPENLLMS_UPSTREAM_TIMEOUT_SECONDS", tc.raw)
++			cfg, err := config.Load()
++			if tc.invalid {
++				if err == nil {
++					t.Fatal("invalid timeout accepted")
++				}
++				if err.Error() != "OPENLLMS_UPSTREAM_TIMEOUT_SECONDS must be an integer from 60 to 3600" {
++					t.Fatal("raw configuration echoed")
++				}
++				return
++			}
++			if err != nil {
++				t.Fatal(err)
++			}
++			want := time.Duration(tc.seconds) * time.Second
++			if cfg.UpstreamTimeout != want || New(&store.Store{}, cfg, nil).proxy.HTTP.Timeout != want {
++				t.Fatalf("timeout not configured: %s", cfg.UpstreamTimeout)
++			}
++		})
++	}
++}
++
++func TestSportsDeskCodexTransportConfiguration(t *testing.T) {
++	t.Setenv("DATABASE_URL", "sqlite:///tmp/config-only.db")
++	for _, tc := range []struct{ raw, want string }{{"", "http"}, {"http", "http"}, {"ws", "ws"}, {"WS", ""}, {" ws", ""}, {"secret-invalid", ""}} {
++		t.Run(tc.raw, func(t *testing.T) {
++			t.Setenv("OPENLLMS_CODEX_TRANSPORT", tc.raw)
++			cfg, err := config.Load()
++			if tc.want == "" {
++				if err == nil || err.Error() != "OPENLLMS_CODEX_TRANSPORT must be http or ws" {
++					t.Fatal("invalid transport not safely rejected")
++				}
++				return
++			}
++			if err != nil || cfg.CodexTransport != tc.want || New(&store.Store{}, cfg, nil).proxy.CodexTransport != tc.want {
++				t.Fatal("transport not configured")
++			}
++		})
++	}
++}
+diff --git a/internal/proxy/codex_bridge.go b/internal/proxy/codex_bridge.go
+index ea82c98..589a749 100644
+--- a/internal/proxy/codex_bridge.go
++++ b/internal/proxy/codex_bridge.go
+@@ -1,10 +1,12 @@
+ package proxy
+ 
+ import (
++	"context"
+ 	"encoding/json"
+ 	"fmt"
+ 	"io"
+ 	"strings"
++	"time"
+ )
+ 
+ const codexDefaultInstructions = "You are a helpful assistant."
+@@ -12,12 +14,13 @@ const codexDefaultInstructions = "You are a helpful assistant."
+ // chatToCodexResponses converts an OpenAI chat.completions body to Codex Responses API body.
+ func chatToCodexResponses(chatBody []byte) (responsesBody []byte, clientStream bool, model string, err error) {
+ 	var in struct {
+-		Model      string          `json:"model"`
+-		Stream     bool            `json:"stream"`
+-		Tools      json.RawMessage `json:"tools"`
+-		ToolChoice json.RawMessage `json:"tool_choice"`
+-		LLMS       json.RawMessage `json:"llms"`
+-		Messages   []struct {
++		Model           string          `json:"model"`
++		ReasoningEffort string          `json:"reasoning_effort"`
++		Stream          bool            `json:"stream"`
++		Tools           json.RawMessage `json:"tools"`
++		ToolChoice      json.RawMessage `json:"tool_choice"`
++		LLMS            json.RawMessage `json:"llms"`
++		Messages        []struct {
+ 			Role       string          `json:"role"`
+ 			Content    json.RawMessage `json:"content"`
+ 			ToolCalls  json.RawMessage `json:"tool_calls"`
+@@ -84,14 +87,27 @@ func chatToCodexResponses(chatBody []byte) (responsesBody []byte, clientStream b
+ 	if len(input) == 0 {
+ 		return nil, false, "", fmt.Errorf("codex bridge: no user/assistant messages")
+ 	}
++	if in.ReasoningEffort != "" && in.ReasoningEffort != "medium" && in.ReasoningEffort != "high" && in.ReasoningEffort != "xhigh" {
++		return nil, false, "", fmt.Errorf("codex bridge: unsupported reasoning_effort %q", in.ReasoningEffort)
++	}
+ 	out := map[string]any{
+ 		"model": model, "instructions": instr, "input": input,
+ 		"store": false, "stream": true,
+ 	}
++	if in.ReasoningEffort != "" {
++		out["reasoning"] = map[string]any{"effort": in.ReasoningEffort}
++	}
+ 	if tools, tc, err := mapClientToolsToCodex(in.Tools, in.ToolChoice, in.LLMS); err != nil {
+ 		return nil, false, "", err
+ 	} else if len(tools) > 0 {
+ 		out["tools"] = tools
++		for _, tool := range tools {
++			toolConfig, _ := tool.(map[string]any)
++			if toolConfig["type"] == "web_search" {
++				out["include"] = []string{"web_search_call.action.sources"}
++				break
++			}
++		}
+ 		if tc != nil {
+ 			out["tool_choice"] = tc
+ 		}
+@@ -157,10 +173,17 @@ func flattenChatContent(raw json.RawMessage) string {
+ }
+ 
+ type codexBridgeOpts struct {
+-	model     string
+-	id        string
+-	accountID string
+-	provider  string
++	startedAt          time.Time
++	requestContext     context.Context
++	upstreamProtocol   string
++	upstreamTransport  string
++	requestID          string
++	upstreamHTTPStatus int
++	gatewayRequestID   string
++	model              string
++	id                 string
++	accountID          string
++	provider           string
+ }
+ 
+ func convertCodexSSEToChat(r io.Reader, w io.Writer, opts codexBridgeOpts) (text string, tin, tout int, err error) {
+@@ -227,13 +250,14 @@ func anyInt(v any) int {
+ }
+ 
+ type pipeCodexToChat struct {
+-	pr   *io.PipeReader
+-	done chan struct{}
++	upstream io.ReadCloser
++	pr       *io.PipeReader
++	done     chan struct{}
+ }
+ 
+ func startCodexChatPipe(upstream io.ReadCloser, opts codexBridgeOpts) *pipeCodexToChat {
+ 	pr, pw := io.Pipe()
+-	p := &pipeCodexToChat{pr: pr, done: make(chan struct{})}
++	p := &pipeCodexToChat{pr: pr, done: make(chan struct{}), upstream: upstream}
+ 	go func() {
+ 		defer close(p.done)
+ 		defer upstream.Close()
+@@ -249,6 +273,7 @@ func startCodexChatPipe(upstream io.ReadCloser, opts codexBridgeOpts) *pipeCodex
+ func (p *pipeCodexToChat) Read(b []byte) (int, error) { return p.pr.Read(b) }
+ func (p *pipeCodexToChat) Close() error {
+ 	err := p.pr.Close()
++	_ = p.upstream.Close()
+ 	<-p.done
+ 	return err
+ }
+diff --git a/internal/proxy/codex_bridge_parse.go b/internal/proxy/codex_bridge_parse.go
+index f88f42c..fc026c7 100644
+--- a/internal/proxy/codex_bridge_parse.go
++++ b/internal/proxy/codex_bridge_parse.go
+@@ -1,15 +1,44 @@
+ package proxy
+ 
+ import (
++	"bufio"
++	"context"
++	"errors"
+ 	"io"
++	"net"
++	"strings"
++	"syscall"
+ 	"time"
+ )
+ 
+ // parseCodexSSE drives chat-bridge state from upstream Responses SSE.
+ func parseCodexSSE(r io.Reader, state *codexParseState, w io.Writer, opts codexBridgeOpts) error {
+ 	streaming := w != nil
+-	return forEachCodexSSEEvent(r, func(typ string, obj map[string]any) error {
++	downstreamFailed := false
++	writeChunk := func(chunk map[string]any) error {
++		err := state.streamWriter.WriteChunk(chunk)
++		downstreamFailed = err != nil
++		return err
++	}
++	err := forEachCodexSSEEvent(r, func(typ string, obj map[string]any) error {
++		state.lastEventAt = time.Now()
++		state.lastEventType = safeCodexEventType(typ)
++		if state.eventCount < 1000000 {
++			state.eventCount++
++		}
+ 		switch typ {
++		case "error":
++			state.terminalStatus = "failed"
++			details := any(obj)
++			if nested, ok := obj["error"].(map[string]any); ok {
++				details = nested
++			}
++			state.terminalError = safeCodexTerminalError(details)
++			return errCodexTerminal
++		case "response.created":
++			if resp, ok := obj["response"].(map[string]any); ok {
++				state.upstreamID, _ = resp["id"].(string)
++			}
+ 		case "response.output_text.delta":
+ 			delta, _ := obj["delta"].(string)
+ 			if delta == "" {
+@@ -18,7 +47,7 @@ func parseCodexSSE(r io.Reader, state *codexParseState, w io.Writer, opts codexB
+ 			state.text.WriteString(delta)
+ 			if streaming {
+ 				state.contentEmitted = true
+-				return state.streamWriter.WriteChunk(map[string]any{
++				return writeChunk(map[string]any{
+ 					"id": opts.id, "object": "chat.completion.chunk",
+ 					"created": time.Now().Unix(), "model": opts.model,
+ 					"choices": []map[string]any{{
+@@ -40,7 +69,7 @@ func parseCodexSSE(r io.Reader, state *codexParseState, w io.Writer, opts codexB
+ 				if streaming {
+ 					if tc, ok := codexToolCallFromItem(item); ok {
+ 						idx := toolCallStreamIndex(state.toolCalls, tc)
+-						return state.streamWriter.WriteChunk(map[string]any{
++						return writeChunk(map[string]any{
+ 							"id": opts.id, "object": "chat.completion.chunk",
+ 							"created": time.Now().Unix(), "model": opts.model,
+ 							"choices": []map[string]any{{
+@@ -54,14 +83,29 @@ func parseCodexSSE(r io.Reader, state *codexParseState, w io.Writer, opts codexB
+ 					}
+ 				}
+ 			}
+-		case "response.completed", "response.incomplete":
++		case "response.completed", "response.incomplete", "response.failed", "response.cancelled":
++			state.terminalStatus = strings.TrimPrefix(typ, "response.")
+ 			if resp, ok := obj["response"].(map[string]any); ok {
++				if id, _ := resp["id"].(string); id != "" {
++					state.upstreamID = id
++				}
++				state.reportedModel = boundedReportedString(resp["model"])
++				if reasoning, ok := resp["reasoning"].(map[string]any); ok {
++					state.reportedReasoningMode = boundedReportedString(reasoning["mode"])
++					state.reportedReasoningEffort = boundedReportedString(reasoning["effort"])
++				}
++				state.terminalError = safeCodexTerminalError(resp["error"])
++				if state.terminalError == nil {
++					state.terminalError = safeCodexTerminalError(resp["incomplete_details"])
++				}
++				state.ingestCitations(resp)
+ 				if u, ok := resp["usage"].(map[string]any); ok {
+ 					state.tin = anyInt(u["input_tokens"])
+ 					state.tout = anyInt(u["output_tokens"])
+ 				}
+ 				parseCompletedOutput(resp, state)
+ 			}
++			return errCodexTerminal
+ 		default:
+ 			if item, ok := obj["item"].(map[string]any); ok {
+ 				state.ingestOutputItem(item, streaming)
+@@ -69,6 +113,71 @@ func parseCodexSSE(r io.Reader, state *codexParseState, w io.Writer, opts codexB
+ 		}
+ 		return nil
+ 	})
++	if diagnostics, ok := r.(*codexWSReader); ok {
++		diagnostics.appendTerminalDiagnostics(state)
++	}
++	state.finishedAt = time.Now()
++	if state.terminalStatus != "" {
++		state.transportStage = "terminal"
++	}
++	if state.terminalStatus == "" {
++		state.terminalStatus = "interrupted"
++		code := "upstream_eof"
++		var timeout net.Error
++		if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &timeout) && timeout.Timeout()) {
++			code = "upstream_timeout"
++		} else if err != nil {
++			code = "upstream_transport_error"
++		}
++		state.terminalError = map[string]any{"code": code}
++		if err != nil {
++			state.transportErrorKind = codexTransportErrorKind(err)
++			state.transportErr = err
++			if state.transportStage == "" {
++				state.transportStage = "upstream_read"
++			}
++			if downstreamFailed {
++				state.transportStage = "downstream_write"
++			}
++		}
++	}
++	if state.gatewayRequestID != "" {
++		logCodexTerminalDiagnostics(state)
++	}
++	if downstreamFailed {
++		return err
++	}
++	return nil
++}
++
++func safeCodexEventType(typ string) string {
++	switch typ {
++	case "response.created", "response.in_progress", "response.completed", "response.incomplete", "response.failed", "response.cancelled",
++		"response.output_item.added", "response.output_item.done", "response.output_text.delta", "response.output_text.done",
++		"response.content_part.added", "response.content_part.done", "response.refusal.delta", "response.refusal.done",
++		"response.function_call_arguments.delta", "response.function_call_arguments.done",
++		"response.web_search_call.in_progress", "response.web_search_call.searching", "response.web_search_call.completed",
++		"response.reasoning_summary_text.delta", "response.reasoning_summary_text.done", "error":
++		return typ
++	case "":
++		return ""
++	default:
++		return "other"
++	}
++}
++
++var errCodexTerminal = errors.New("codex terminal received")
++
++func boundedReportedString(value any) string {
++	text, ok := value.(string)
++	if !ok {
++		return ""
++	}
++	text = strings.TrimSpace(text)
++	if len(text) == 0 || len(text) > 128 {
++		return ""
++	}
++	return text
+ }
+ 
+ func writeCodexStreamFinale(state *codexParseState, w io.Writer, opts codexBridgeOpts) error {
+@@ -88,10 +197,7 @@ func writeCodexStreamFinale(state *codexParseState, w io.Writer, opts codexBridg
+ 			}
+ 		}
+ 	}
+-	finish := "stop"
+-	if len(state.toolCalls) > 0 {
+-		finish = "tool_calls"
+-	}
++	finish := state.finishReason()
+ 	fin := map[string]any{
+ 		"id": opts.id, "object": "chat.completion.chunk",
+ 		"created": time.Now().Unix(), "model": opts.model,
+@@ -116,11 +222,22 @@ func writeCodexStreamFinale(state *codexParseState, w io.Writer, opts codexBridg
+ }
+ 
+ func newCodexParseState(opts codexBridgeOpts, w io.Writer) *codexParseState {
++	startedAt := opts.startedAt
++	if startedAt.IsZero() {
++		startedAt = time.Now()
++	}
+ 	st := &codexParseState{
+-		accountID: opts.accountID,
+-		provider:  opts.provider,
+-		model:     opts.model,
+-		id:        opts.id,
++		startedAt: startedAt, lastEventAt: startedAt,
++		requestContext:     opts.requestContext,
++		upstreamProtocol:   safeUpstreamProtocol(opts.upstreamProtocol),
++		upstreamTransport:  opts.upstreamTransport,
++		requestID:          safeUpstreamRequestID(opts.requestID),
++		upstreamHTTPStatus: opts.upstreamHTTPStatus,
++		gatewayRequestID:   opts.gatewayRequestID,
++		accountID:          opts.accountID,
++		provider:           opts.provider,
++		model:              opts.model,
++		id:                 opts.id,
+ 	}
+ 	if w != nil {
+ 		st.streamWriter = &sseWriter{w: w, model: opts.model, id: opts.id}
+@@ -139,5 +256,125 @@ func (st *codexParseState) llmsMeta() map[string]any {
+ 	if len(st.hostedTools) > 0 {
+ 		meta["hosted_tools"] = st.hostedTools
+ 	}
++	if len(st.citations) > 0 {
++		meta["citations"] = st.citations
++	}
++	terminal := map[string]any{"status": st.terminalStatus,
++		"upstream_elapsed_ms":       boundedElapsedMS(st.finishedAt, st.startedAt),
++		"last_event_age_ms":         boundedElapsedMS(st.finishedAt, st.lastEventAt),
++		"event_count":               st.eventCount,
++		"request_context_cancelled": st.requestContext != nil && st.requestContext.Err() != nil,
++	}
++	if st.transportErrorKind != "" {
++		terminal["transport_error_kind"] = st.transportErrorKind
++	}
++	if diagnostics := codexSafeDiagnostics(st); len(diagnostics) > 0 {
++		terminal["diagnostics"] = diagnostics
++	}
++	if st.upstreamTransport == "http" || st.upstreamTransport == "ws" {
++		terminal["upstream_transport"] = st.upstreamTransport
++	}
++	if st.upstreamProtocol != "" {
++		terminal["upstream_http_protocol"] = st.upstreamProtocol
++	}
++	if st.requestID != "" {
++		terminal["request_id"] = st.requestID
++	}
++	if st.websocketCloseCode >= 1000 && st.websocketCloseCode <= 4999 {
++		terminal["websocket_close_code"] = st.websocketCloseCode
++	}
++	if st.websocketMessageTooBig {
++		terminal["websocket_message_too_big"] = true
++	}
++	if st.websocketProtocolError {
++		terminal["websocket_protocol_error"] = true
++	}
++	if st.lastEventType != "" {
++		terminal["last_event_type"] = st.lastEventType
++	}
++	if st.upstreamID != "" {
++		terminal["upstream_response_id"] = st.upstreamID
++	}
++	if st.terminalError != nil {
++		terminal["error"] = st.terminalError
++	}
++	if st.reportedModel != "" {
++		terminal["upstream_reported_model"] = st.reportedModel
++	}
++	if st.reportedReasoningMode != "" {
++		terminal["upstream_reported_reasoning_mode"] = st.reportedReasoningMode
++	}
++	if st.reportedReasoningEffort != "" {
++		terminal["upstream_reported_reasoning_effort"] = st.reportedReasoningEffort
++	}
++	meta["terminal"] = terminal
+ 	return meta
+ }
++
++// Keep diagnostic codes, never upstream error messages or arbitrary payloads.
++func safeCodexTerminalError(value any) any {
++	if value == nil {
++		return nil
++	}
++	details, _ := value.(map[string]any)
++	code, _ := details["code"].(string)
++	if code == "" {
++		code, _ = details["reason"].(string)
++	}
++	switch code {
++	case "max_output_tokens", "content_filter", "server_error", "rate_limit_exceeded", "invalid_prompt", "cancelled":
++	default:
++		code = "upstream_error"
++	}
++	return map[string]any{"code": code}
++}
++
++func codexTransportErrorKind(err error) string {
++	switch {
++	case errors.Is(err, context.DeadlineExceeded):
++		return "deadline_exceeded"
++	case errors.Is(err, context.Canceled):
++		return "context_cancelled"
++	case errors.Is(err, bufio.ErrTooLong):
++		return "scanner_token_too_long"
++	case errors.Is(err, io.ErrUnexpectedEOF), errors.Is(err, io.EOF):
++		return "unexpected_eof"
++	case errors.Is(err, syscall.ECONNRESET):
++		return "connection_reset"
++	case errors.Is(err, net.ErrClosed), errors.Is(err, io.ErrClosedPipe), errors.Is(err, syscall.EPIPE):
++		return "connection_closed"
++	}
++	var timeout net.Error
++	if errors.As(err, &timeout) && timeout.Timeout() {
++		return "deadline_exceeded"
++	}
++	return "unknown_transport_error"
++}
++func boundedElapsedMS(end, start time.Time) int64 {
++	elapsed := end.Sub(start).Milliseconds()
++	if elapsed < 0 {
++		return 0
++	}
++	if elapsed > 86400000 {
++		return 86400000
++	}
++	return elapsed
++}
++func safeUpstreamProtocol(protocol string) string {
++	switch protocol {
++	case "HTTP/1.1", "HTTP/2.0":
++		return protocol
++	}
++	return ""
++}
++func safeUpstreamRequestID(id string) string {
++	if len(id) < 1 || len(id) > 128 {
++		return ""
++	}
++	for _, ch := range id {
++		if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '-') {
++			return ""
++		}
++	}
++	return id
++}
+diff --git a/internal/proxy/codex_bridge_test.go b/internal/proxy/codex_bridge_test.go
+index cdc0c8a..df631d6 100644
+--- a/internal/proxy/codex_bridge_test.go
++++ b/internal/proxy/codex_bridge_test.go
+@@ -3,8 +3,11 @@ package proxy
+ import (
+ 	"bytes"
+ 	"encoding/json"
++	"fmt"
++	"io"
+ 	"strings"
+ 	"testing"
++	"time"
+ )
+ 
+ func testBridgeOpts(model, id string) codexBridgeOpts {
+@@ -419,3 +422,59 @@ func TestToolCallStreamIndex(t *testing.T) {
+ 		t.Fatalf("got %d", got)
+ 	}
+ }
++
++func TestCodexTerminalDiagnosticsIncludesSafeTransportObservations(t *testing.T) {
++	st := newCodexParseState(codexBridgeOpts{
++		startedAt:         time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC),
++		upstreamTransport: "ws",
++		upstreamProtocol:  "HTTP/1.1",
++		requestID:         "req-123",
++		model:             "model-secret",
++	}, nil)
++	st.finishedAt = st.startedAt.Add(25 * time.Millisecond)
++	st.terminalStatus = "interrupted"
++	st.transportErrorKind = "unexpected_eof"
++	st.lastEventType = "response.output_text.delta"
++	st.eventCount = 2
++
++	terminal := st.llmsMeta()["terminal"].(map[string]any)
++	diagnostics, ok := terminal["diagnostics"].(map[string]any)
++	if !ok {
++		t.Fatalf("terminal diagnostics missing: %#v", terminal)
++	}
++	if diagnostics["schema_version"] != 1 || diagnostics["upstream_transport"] != "ws" || diagnostics["stage"] != "upstream_read" {
++		t.Fatalf("unexpected safe diagnostics: %#v", diagnostics)
++	}
++	encoded, err := json.Marshal(diagnostics)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if strings.Contains(string(encoded), "model-secret") {
++		t.Fatalf("diagnostics leaked unsafe values: %s", encoded)
++	}
++}
++
++func TestCodexDiagnosticsNormalizeWrappedErrorsWithoutRawText(t *testing.T) {
++	st := newCodexParseState(codexBridgeOpts{upstreamTransport: "ws"}, nil)
++	st.finishedAt = time.Now()
++	st.terminalStatus = "interrupted"
++	st.transportStage = "upstream_read"
++	st.transportErrorKind = codexTransportErrorKind(fmt.Errorf("https://private.invalid secret-token: %w", io.ErrUnexpectedEOF))
++	st.transportErr = fmt.Errorf("https://private.invalid secret-token: %w", io.ErrUnexpectedEOF)
++
++	diagnostics := codexSafeDiagnostics(st)
++	if diagnostics["root_cause"] != "unexpected_eof" || diagnostics["safe_message_code"] != "unexpected_eof" || diagnostics["error_origin"] != "gateway_upstream" {
++		t.Fatalf("incorrect normalized error fields: %#v", diagnostics)
++	}
++	encoded, err := json.Marshal(diagnostics)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if strings.Contains(string(encoded), "private.invalid") || strings.Contains(string(encoded), "secret-token") || len(diagnostics["error_fingerprint"].(string)) != 64 {
++		t.Fatalf("unsafe diagnostics: %s", encoded)
++	}
++	chain := diagnostics["cause_chain"].([]map[string]string)
++	if len(chain) == 0 || chain[0]["type"] != "eof" || chain[0]["code"] != "UNEXPECTED_EOF" {
++		t.Fatalf("incorrect cause chain: %#v", chain)
++	}
++}
+diff --git a/internal/proxy/codex_diagnostics.go b/internal/proxy/codex_diagnostics.go
+new file mode 100644
+index 0000000..12825d0
+--- /dev/null
++++ b/internal/proxy/codex_diagnostics.go
+@@ -0,0 +1,229 @@
++package proxy
++
++import (
++	"bufio"
++	"context"
++	"crypto/sha256"
++	"crypto/tls"
++	"crypto/x509"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"io"
++	"log/slog"
++	"net"
++	"syscall"
++
++	"github.com/google/uuid"
++)
++
++func codexSafeDiagnostics(state *codexParseState) map[string]any {
++	if state == nil {
++		return nil
++	}
++	stage := state.transportStage
++	if stage == "" {
++		stage = "upstream_read"
++	}
++	root := safeCodexRootCause(state)
++	out := map[string]any{
++		"schema_version": 1,
++		"stage":          stage,
++		"event_count":    state.eventCount,
++	}
++	if id, err := uuid.Parse(state.gatewayRequestID); err == nil {
++		out["gateway_request_id"] = id.String()
++	}
++	if state.upstreamTransport == "http" || state.upstreamTransport == "ws" {
++		out["upstream_transport"] = state.upstreamTransport
++	}
++	switch state.terminalStatus {
++	case "completed", "failed", "incomplete", "interrupted":
++		out["upstream_terminal_status"] = state.terminalStatus
++	}
++	if state.upstreamProtocol != "" {
++		out["upstream_http_protocol"] = state.upstreamProtocol
++	}
++	if safeCodexIdentifier(state.requestID) {
++		out["upstream_request_id"] = state.requestID
++	}
++	if state.upstreamID != "" && len(state.upstreamID) <= 128 && safeCodexIdentifier(state.upstreamID) {
++		out["upstream_response_id"] = state.upstreamID
++	}
++	if !state.startedAt.IsZero() && !state.finishedAt.IsZero() {
++		out["elapsed_ms"] = boundedElapsedMS(state.finishedAt, state.startedAt)
++	}
++	if !state.lastEventAt.IsZero() {
++		out["last_event_at"] = state.lastEventAt.UTC().Format("2006-01-02T15:04:05.000Z")
++		out["last_event_age_ms"] = boundedElapsedMS(state.finishedAt, state.lastEventAt)
++	}
++	if state.lastEventType != "" {
++		out["last_event_type"] = safeCodexEventType(state.lastEventType)
++	}
++	if state.upstreamHTTPStatus >= 100 && state.upstreamHTTPStatus <= 599 {
++		out["upstream_http_status"] = state.upstreamHTTPStatus
++	}
++	if state.websocketCloseObserved {
++		out["close_frame_received"] = true
++		if state.websocketCloseCode >= 1000 && state.websocketCloseCode <= 4999 {
++			out["websocket_close_code"] = state.websocketCloseCode
++		}
++	}
++	if state.websocketMessageTooBig {
++		out["websocket_message_too_big"] = true
++	}
++	if state.websocketProtocolError {
++		out["websocket_protocol_error"] = true
++	}
++	if state.transportErr != nil || state.upstreamHTTPStatus >= 400 || state.websocketCloseObserved {
++		chain := safeCodexCauseChain(state.transportErr)
++		if len(chain) > 0 {
++			out["cause_chain"] = chain
++		}
++		origin := "gateway_upstream"
++		if stage == "downstream_write" {
++			origin = "gateway_downstream"
++		}
++		out["error_origin"] = origin
++		out["root_cause"] = root
++		out["safe_message_code"] = root
++		fingerprintInput := map[string]any{"stage": stage, "root_cause": root}
++		if len(chain) > 0 {
++			fingerprintInput["cause_chain"] = chain
++		}
++		if data, err := json.Marshal(fingerprintInput); err == nil {
++			sum := sha256.Sum256(data)
++			out["error_fingerprint"] = hex.EncodeToString(sum[:])
++		}
++	}
++	return out
++}
++
++func safeCodexRootCause(state *codexParseState) string {
++	if state.websocketMessageTooBig {
++		return "message_too_big"
++	}
++	if state.websocketProtocolError {
++		return "protocol_error"
++	}
++	if state.upstreamHTTPStatus >= 400 {
++		return "http_rejected"
++	}
++	if state.websocketCloseObserved {
++		return "websocket_close"
++	}
++	if state.transportErr != nil {
++		var dnsErr *net.DNSError
++		if errors.As(state.transportErr, &dnsErr) {
++			return "dns_error"
++		}
++		var verifyErr *tls.CertificateVerificationError
++		var unknownAuthority x509.UnknownAuthorityError
++		var hostnameErr x509.HostnameError
++		var invalidCert x509.CertificateInvalidError
++		if errors.As(state.transportErr, &verifyErr) || errors.As(state.transportErr, &unknownAuthority) || errors.As(state.transportErr, &hostnameErr) || errors.As(state.transportErr, &invalidCert) {
++			return "tls_error"
++		}
++		if errors.Is(state.transportErr, syscall.ECONNREFUSED) {
++			return "connection_refused"
++		}
++	}
++	if isCodexRootCause(state.transportErrorKind) {
++		return state.transportErrorKind
++	}
++	return "unknown"
++}
++
++func safeCodexCauseChain(err error) []map[string]string {
++	chain := make([]map[string]string, 0, 4)
++	for depth := 0; err != nil && depth < 4; depth++ {
++		kind, code := codexCauseCode(err)
++		entry := map[string]string{"type": kind}
++		if code != "" {
++			entry["code"] = code
++		}
++		chain = append(chain, entry)
++		err = errors.Unwrap(err)
++	}
++	return chain
++}
++
++func codexCauseCode(err error) (string, string) {
++	switch {
++	case errors.Is(err, context.DeadlineExceeded):
++		return "context", "DEADLINE_EXCEEDED"
++	case errors.Is(err, context.Canceled):
++		return "context", "CONTEXT_CANCELED"
++	case errors.Is(err, io.ErrUnexpectedEOF):
++		return "eof", "UNEXPECTED_EOF"
++	case errors.Is(err, io.EOF):
++		return "eof", "EOF"
++	case errors.Is(err, syscall.ECONNRESET):
++		return "syscall", "ECONNRESET"
++	case errors.Is(err, syscall.ECONNABORTED):
++		return "syscall", "ECONNABORTED"
++	case errors.Is(err, syscall.ECONNREFUSED):
++		return "syscall", "ECONNREFUSED"
++	case errors.Is(err, syscall.EPIPE):
++		return "syscall", "EPIPE"
++	case errors.Is(err, syscall.ETIMEDOUT):
++		return "syscall", "ETIMEDOUT"
++	case errors.Is(err, bufio.ErrTooLong):
++		return "scanner", "SCANNER_TOO_LONG"
++	}
++	var dnsErr *net.DNSError
++	if errors.As(err, &dnsErr) {
++		if dnsErr.IsNotFound {
++			return "dns", "ENOTFOUND"
++		}
++		if dnsErr.IsTemporary {
++			return "dns", "EAI_AGAIN"
++		}
++		return "dns", ""
++	}
++	var verifyErr *tls.CertificateVerificationError
++	var unknownAuthority x509.UnknownAuthorityError
++	var hostnameErr x509.HostnameError
++	var invalidCert x509.CertificateInvalidError
++	if errors.As(err, &verifyErr) || errors.As(err, &unknownAuthority) || errors.As(err, &hostnameErr) || errors.As(err, &invalidCert) {
++		return "tls", ""
++	}
++	var opErr *net.OpError
++	if errors.As(err, &opErr) {
++		return "net", ""
++	}
++	var netErr net.Error
++	if errors.As(err, &netErr) {
++		return "net", ""
++	}
++	return "unknown", "UNKNOWN"
++}
++
++func isCodexRootCause(value string) bool {
++	switch value {
++	case "deadline_exceeded", "context_cancelled", "unexpected_eof", "connection_reset", "connection_closed", "connection_refused", "dns_error", "tls_error", "http_rejected", "websocket_close", "message_too_big", "protocol_error", "json_error", "scanner_token_too_long", "unknown":
++		return true
++	default:
++		return false
++	}
++}
++
++func safeCodexIdentifier(value string) bool {
++	if value == "" || len(value) > 128 {
++		return false
++	}
++	for _, ch := range value {
++		if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '-' || ch == '.' || ch == ':') {
++			return false
++		}
++	}
++	return true
++}
++
++func logCodexTerminalDiagnostics(state *codexParseState) {
++	diagnostics := codexSafeDiagnostics(state)
++	if diagnostics == nil {
++		return
++	}
++	slog.Default().Info("gateway upstream transport ended", "event", "upstream_transport_ended", "gateway_request_id", state.gatewayRequestID, "diagnostics", diagnostics)
++}
+diff --git a/internal/proxy/codex_recovery.go b/internal/proxy/codex_recovery.go
+new file mode 100644
+index 0000000..99e968b
+--- /dev/null
++++ b/internal/proxy/codex_recovery.go
+@@ -0,0 +1,20 @@
++package proxy
++
++import (
++	"context"
++
++	"github.com/google/uuid"
++)
++
++type codexHTTPRecoveryContextKey struct{}
++
++// WithCodexHTTPRecovery marks one request to use HTTP for its already-authorized
++// Codex OAuth account. The marker is request-local and is never stored on Engine.
++func WithCodexHTTPRecovery(ctx context.Context, accountID uuid.UUID) context.Context {
++	return context.WithValue(ctx, codexHTTPRecoveryContextKey{}, accountID)
++}
++
++func codexHTTPRecoveryAccount(ctx context.Context) (uuid.UUID, bool) {
++	accountID, ok := ctx.Value(codexHTTPRecoveryContextKey{}).(uuid.UUID)
++	return accountID, ok
++}
+diff --git a/internal/proxy/codex_tools.go b/internal/proxy/codex_tools.go
+index 5171398..efed3ed 100644
+--- a/internal/proxy/codex_tools.go
++++ b/internal/proxy/codex_tools.go
+@@ -1,6 +1,7 @@
+ package proxy
+ 
+ import (
++	"context"
+ 	"encoding/json"
+ 	"fmt"
+ 	"io"
+@@ -284,16 +285,41 @@ func parseCompletedOutput(resp map[string]any, state *codexParseState) {
+ }
+ 
+ type codexParseState struct {
+-	text           strings.Builder
+-	tin, tout      int
+-	hostedTools    []map[string]any
+-	toolCalls      []map[string]any
+-	accountID      string
+-	provider       string
+-	streamWriter   ioWriter
+-	model          string
+-	id             string
+-	contentEmitted bool // true once a content delta was written to the client
++	upstreamTransport       string
++	startedAt               time.Time
++	lastEventAt             time.Time
++	finishedAt              time.Time
++	lastEventType           string
++	websocketCloseCode      int
++	websocketMessageTooBig  bool
++	websocketProtocolError  bool
++	eventCount              int
++	transportErrorKind      string
++	transportErr            error
++	transportStage          string
++	upstreamHTTPStatus      int
++	gatewayRequestID        string
++	websocketCloseObserved  bool
++	requestContext          context.Context
++	upstreamProtocol        string
++	requestID               string
++	text                    strings.Builder
++	tin, tout               int
++	hostedTools             []map[string]any
++	citations               []map[string]any
++	terminalStatus          string
++	upstreamID              string
++	reportedModel           string
++	reportedReasoningMode   string
++	reportedReasoningEffort string
++	terminalError           any
++	toolCalls               []map[string]any
++	accountID               string
++	provider                string
++	streamWriter            ioWriter
++	model                   string
++	id                      string
++	contentEmitted          bool // true once a content delta was written to the client
+ }
+ 
+ type ioWriter interface {
+@@ -341,6 +367,7 @@ func (s *sseWriter) WriteHostedToolEvent(phase string, tool map[string]any) erro
+ }
+ 
+ func (st *codexParseState) ingestOutputItem(item map[string]any, streaming bool) {
++	st.ingestCitations(map[string]any{"output": []any{item}})
+ 	if ht, ok := codexHostedToolFromItem(item); ok {
+ 		st.hostedTools = mergeHostedTool(st.hostedTools, ht)
+ 		if streaming && st.streamWriter != nil {
+@@ -360,12 +387,58 @@ func (st *codexParseState) ingestOutputItem(item map[string]any, streaming bool)
+ 	// Message items in output_item.* / completed.output are tool-scan only.
+ }
+ 
+-func (st *codexParseState) buildCompletionJSON() []byte {
+-	text := st.text.String()
+-	finish := "stop"
++func (st *codexParseState) ingestCitations(resp map[string]any) {
++	out, _ := resp["output"].([]any)
++	for _, item := range out {
++		message, _ := item.(map[string]any)
++		if message["type"] != "message" {
++			continue
++		}
++		content, _ := message["content"].([]any)
++		for _, part := range content {
++			textPart, _ := part.(map[string]any)
++			annotations, _ := textPart["annotations"].([]any)
++			for _, annotation := range annotations {
++				a, _ := annotation.(map[string]any)
++				if a["type"] != "url_citation" {
++					continue
++				}
++				url, _ := a["url"].(string)
++				if url == "" {
++					continue
++				}
++				citation := map[string]any{"url": url}
++				if title, _ := a["title"].(string); title != "" {
++					citation["title"] = title
++				}
++				seen := false
++				for _, existing := range st.citations {
++					if existing["url"] == url {
++						seen = true
++						break
++					}
++				}
++				if !seen {
++					st.citations = append(st.citations, citation)
++				}
++			}
++		}
++	}
++}
++
++func (st *codexParseState) finishReason() string {
++	if st.terminalStatus != "completed" {
++		return "error"
++	}
+ 	if len(st.toolCalls) > 0 {
+-		finish = "tool_calls"
++		return "tool_calls"
+ 	}
++	return "stop"
++}
++
++func (st *codexParseState) buildCompletionJSON() []byte {
++	text := st.text.String()
++	finish := st.finishReason()
+ 	msg := map[string]any{"role": "assistant", "content": text}
+ 	if len(st.toolCalls) > 0 {
+ 		msg["tool_calls"] = st.toolCalls
+diff --git a/internal/proxy/codex_websocket.go b/internal/proxy/codex_websocket.go
+new file mode 100644
+index 0000000..649990b
+--- /dev/null
++++ b/internal/proxy/codex_websocket.go
+@@ -0,0 +1,174 @@
++package proxy
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"io"
++	"net/http"
++	"time"
++
++	"github.com/coder/websocket"
++	"github.com/goodtekxyz/openllms/internal/store"
++)
++
++// A single connection carries exactly one response.create. Once its write starts,
++// a failure is an interrupted execution, never a reason to replay the request.
++func (e *Engine) execCodexWebSocket(ctx context.Context, acc *store.Account, body []byte, req *http.Request, model string, stream bool, start time.Time) (*Result, error) {
++	var create map[string]any
++	if json.Unmarshal(body, &create) != nil {
++		return nil, errCodexWSMessage
++	}
++	create["type"] = "response.create"
++	payload, err := json.Marshal(create)
++	if err != nil {
++		return nil, errCodexWSMessage
++	}
++	budget := 45 * time.Minute
++	client := http.DefaultClient
++	if e.HTTP != nil {
++		client = e.HTTP
++		if client.Timeout > 0 {
++			budget = client.Timeout
++		}
++	}
++	executionCtx, cancel := context.WithDeadline(ctx, start.Add(budget))
++	// The explicit execution context owns the whole lifetime, including reads.
++	dialClient := *client
++	dialClient.Timeout = 0
++	headers := req.Header.Clone()
++	headers.Set("OpenAI-Beta", "responses_websockets=2026-02-06")
++	conn, handshake, err := websocket.Dial(executionCtx, req.URL.String(), &websocket.DialOptions{HTTPClient: &dialClient, HTTPHeader: headers})
++	if err != nil {
++		cancel()
++		status := http.StatusBadGateway
++		protocol := ""
++		requestID := ""
++		upstreamStatus := 0
++		if handshake != nil {
++			protocol = handshake.Proto
++			requestID = handshake.Header.Get("X-Request-Id")
++			upstreamStatus = handshake.StatusCode
++			if handshake.Body != nil {
++				handshake.Body.Close()
++			}
++			if handshake.StatusCode >= 400 {
++				status = handshake.StatusCode
++			}
++		}
++		diagnosticState := newCodexParseState(codexBridgeOpts{startedAt: start, upstreamTransport: "ws", upstreamProtocol: protocol, requestID: requestID, upstreamHTTPStatus: upstreamStatus, gatewayRequestID: gatewayRequestIDFromContext(ctx)}, nil)
++		diagnosticState.finishedAt = time.Now()
++		diagnosticState.transportStage = "upstream_dial"
++		diagnosticState.transportErr = err
++		diagnosticState.transportErrorKind = codexTransportErrorKind(err)
++		if diagnosticState.gatewayRequestID != "" {
++			logCodexTerminalDiagnostics(diagnosticState)
++		}
++		return &Result{StatusCode: status, Error: "codex_websocket_handshake", AccountID: acc.ID, Model: model, Latency: time.Since(start)}, nil
++	}
++	conn.SetReadLimit(8 * 1024 * 1024)
++	upstream := startCodexWSCreate(executionCtx, cancel, conn, payload)
++	opts := codexBridgeOpts{model: model, id: "chatcmpl-" + acc.ID.String()[:8], accountID: acc.ID.String(), provider: acc.Vendor, startedAt: start, requestContext: ctx, upstreamTransport: "ws", upstreamProtocol: handshake.Proto, requestID: handshake.Header.Get("X-Request-Id"), upstreamHTTPStatus: handshake.StatusCode, gatewayRequestID: gatewayRequestIDFromContext(ctx)}
++	result := &Result{StatusCode: http.StatusOK, AccountID: acc.ID, Model: model, Latency: time.Since(start)}
++	if stream {
++		result.Stream = startCodexChatPipe(upstream, opts)
++		result.Header = http.Header{"Content-Type": []string{"text/event-stream"}}
++		return result, nil
++	}
++	defer upstream.Close()
++	result.Body, result.TokensIn, result.TokensOut, err = aggregateCodexSSE(upstream, opts)
++	result.Header = http.Header{"Content-Type": []string{"application/json"}}
++	return result, err
++}
++
++type codexWSConn interface {
++	Write(context.Context, websocket.MessageType, []byte) error
++	Read(context.Context) (websocket.MessageType, []byte, error)
++	CloseNow() error
++}
++
++type codexWSReader struct {
++	conn               codexWSConn
++	ctx                context.Context
++	cancel             context.CancelFunc
++	pending            []byte
++	initialErr         error
++	createWriteErr     error
++	websocketCloseCode int
++	hasWebSocketClose  bool
++	messageTooBig      bool
++	protocolError      bool
++}
++
++func startCodexWSCreate(ctx context.Context, cancel context.CancelFunc, conn codexWSConn, payload []byte) *codexWSReader {
++	// Even a failed/partial write may have reached the provider. Return a reader
++	// that yields a terminal interruption through the existing bridge.
++	writeErr := conn.Write(ctx, websocket.MessageText, payload)
++	return &codexWSReader{conn: conn, ctx: ctx, cancel: cancel, initialErr: writeErr, createWriteErr: writeErr}
++}
++
++var errCodexWSMessage = io.ErrUnexpectedEOF
++
++func (r *codexWSReader) Read(p []byte) (int, error) {
++	if len(p) == 0 {
++		return 0, nil
++	}
++	if r.initialErr != nil {
++		err := r.initialErr
++		r.initialErr = nil
++		return 0, err
++	}
++	if len(r.pending) == 0 {
++		typ, payload, err := r.conn.Read(r.ctx)
++		if err != nil {
++			if errors.Is(err, websocket.ErrMessageTooBig) {
++				r.messageTooBig = true
++			}
++			if code := websocket.CloseStatus(err); code != -1 {
++				r.websocketCloseCode = int(code)
++				r.hasWebSocketClose = true
++			}
++			// Normal WebSocket close without response.completed remains interrupted EOF.
++			if websocket.CloseStatus(err) == websocket.StatusNormalClosure || websocket.CloseStatus(err) == websocket.StatusGoingAway {
++				return 0, io.EOF
++			}
++			return 0, err
++		}
++		if typ != websocket.MessageText {
++			r.protocolError = true
++			return 0, errCodexWSMessage
++		}
++		var compact bytes.Buffer
++		if json.Compact(&compact, payload) != nil {
++			r.protocolError = true
++			return 0, errCodexWSMessage
++		}
++		r.pending = append([]byte("data: "), compact.Bytes()...)
++		r.pending = append(r.pending, '\n', '\n')
++	}
++	n := copy(p, r.pending)
++	r.pending = r.pending[n:]
++	return n, nil
++}
++func (r *codexWSReader) Close() error { r.cancel(); return r.conn.CloseNow() }
++
++func (r *codexWSReader) appendTerminalDiagnostics(state *codexParseState) {
++	if r.createWriteErr != nil {
++		state.transportStage = "upstream_create_write"
++		state.transportErr = r.createWriteErr
++		state.transportErrorKind = codexTransportErrorKind(r.createWriteErr)
++	}
++	if r.hasWebSocketClose {
++		state.websocketCloseObserved = true
++		state.websocketCloseCode = r.websocketCloseCode
++	}
++	if r.messageTooBig {
++		state.websocketMessageTooBig = true
++		state.transportErrorKind = "message_too_big"
++	}
++	if r.protocolError {
++		state.websocketProtocolError = true
++		state.transportErrorKind = "protocol_error"
++	}
++}
+diff --git a/internal/proxy/codex_websocket_probe.go b/internal/proxy/codex_websocket_probe.go
+new file mode 100644
+index 0000000..421c64c
+--- /dev/null
++++ b/internal/proxy/codex_websocket_probe.go
+@@ -0,0 +1,65 @@
++package proxy
++
++import (
++	"context"
++	"github.com/coder/websocket"
++	"github.com/goodtekxyz/openllms/internal/store"
++	"net/http"
++	"net/url"
++	"strings"
++	"time"
++)
++
++type CodexWebSocketProbe struct {
++	OK         bool   `json:"ok"`
++	HTTPStatus int    `json:"http_status,omitempty"`
++	Protocol   string `json:"http_protocol,omitempty"`
++	ErrorCode  string `json:"error_code,omitempty"`
++}
++
++// CheckCodexWebSocketHandshake performs no refresh or application-message write.
++// It accepts only the official Codex endpoint and never follows redirects.
++func (e *Engine) CheckCodexWebSocketHandshake(ctx context.Context, acc *store.Account) CodexWebSocketProbe {
++	if acc == nil || !strings.EqualFold(acc.Vendor, "codex") || !strings.EqualFold(acc.AuthType, "oauth") {
++		return CodexWebSocketProbe{ErrorCode: "no_eligible_account"}
++	}
++	target, err := url.Parse(resolveResponsesURL(acc))
++	if err != nil || target.Scheme != "https" || target.Host != "chatgpt.com" || target.Path != "/backend-api/codex/responses" || target.RawQuery != "" || target.Fragment != "" || target.User != nil {
++		return CodexWebSocketProbe{ErrorCode: "unsafe_target"}
++	}
++	cred, token, err := e.loadCredential(ctx, acc)
++	if err != nil {
++		return CodexWebSocketProbe{ErrorCode: "secrets_error"}
++	}
++	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
++	applyUpstreamAuth(req, acc, cred, token, true, "Authorization", "Bearer ")
++	req.Header.Set("OpenAI-Beta", "responses_websockets=2026-02-06")
++	client := e.HTTP
++	if client == nil {
++		client = http.DefaultClient
++	}
++	return probeCodexWebSocket(ctx, req, client)
++}
++func probeCodexWebSocket(ctx context.Context, req *http.Request, client *http.Client) CodexWebSocketProbe {
++	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
++	defer cancel()
++	clientCopy := *client
++	clientCopy.Timeout = 0
++	clientCopy.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
++	conn, response, err := websocket.Dial(ctx, req.URL.String(), &websocket.DialOptions{HTTPClient: &clientCopy, HTTPHeader: req.Header})
++	result := CodexWebSocketProbe{}
++	if response != nil {
++		result.HTTPStatus = response.StatusCode
++		result.Protocol = safeUpstreamProtocol(response.Proto)
++		if response.Body != nil {
++			response.Body.Close()
++		}
++	}
++	if err != nil {
++		result.ErrorCode = "handshake_failed"
++		return result
++	}
++	conn.CloseNow() // Deliberately no Conn.Write, Ping, or response.create.
++	result.OK = true
++	return result
++}
+diff --git a/internal/proxy/proxy.go b/internal/proxy/proxy.go
+index ff31408..08d6905 100644
+--- a/internal/proxy/proxy.go
++++ b/internal/proxy/proxy.go
+@@ -57,12 +57,13 @@ type AccountStore interface {
+ }
+ 
+ type Engine struct {
+-	Store    AccountStore
+-	Secrets  secrets.Client
+-	HTTP     *http.Client
+-	Selector *router.Selector
+-	Affinity *Affinity
+-	Log      *slog.Logger
++	Store          AccountStore
++	Secrets        secrets.Client
++	HTTP           *http.Client
++	CodexTransport string
++	Selector       *router.Selector
++	Affinity       *Affinity
++	Log            *slog.Logger
+ 
+ 	refreshGates *refreshGates
+ 
+@@ -84,6 +85,21 @@ func (e *Engine) selector() *router.Selector {
+ 	return e.Selector
+ }
+ 
++type gatewayRequestIDKey struct{}
++
++func WithGatewayRequestID(ctx context.Context, id string) context.Context {
++	parsed, err := uuid.Parse(id)
++	if err != nil {
++		return ctx
++	}
++	return context.WithValue(ctx, gatewayRequestIDKey{}, parsed.String())
++}
++
++func gatewayRequestIDFromContext(ctx context.Context) string {
++	id, _ := ctx.Value(gatewayRequestIDKey{}).(string)
++	return id
++}
++
+ type DispatchMeta struct {
+ 	SessionKey string
+ 	Header     http.Header
+@@ -141,6 +157,9 @@ func fallbackSlugs(cfg []byte) []string {
+ 
+ func (e *Engine) dispatchWithFallbacks(ctx context.Context, projectID uuid.UUID, rt *store.Route, body []byte, meta DispatchMeta, call callFn, accountFilter ...func([]store.Account) []store.Account) (*Result, error) {
+ 	res, err := e.dispatch(ctx, rt, body, meta, call, accountFilter...)
++	if _, recovery := codexHTTPRecoveryAccount(ctx); recovery {
++		return res, err
++	}
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -199,6 +218,15 @@ func filterParallelAccounts(accounts []store.Account, allowOAuth bool) []store.A
+ 
+ func (e *Engine) dispatchParallel(ctx context.Context, rt *store.Route, accounts []store.Account, body []byte, meta DispatchMeta, sessionKey string, sticky uuid.UUID, call callFn) (*Result, error) {
+ 	pool := filterParallelAccounts(accounts, parallelAllowOAuth(rt.Config))
++	if e.CodexTransport == "ws" {
++		for _, acc := range pool {
++			if strings.EqualFold(acc.Vendor, "codex") && strings.EqualFold(acc.AuthType, "oauth") {
++				rt2 := *rt
++				rt2.Strategy = string(router.Sequential)
++				return e.dispatch(ctx, &rt2, body, meta, call)
++			}
++		}
++	}
+ 	if len(pool) == 0 {
+ 		// Safe fallback: sequential on original list
+ 		rt2 := *rt
+@@ -304,6 +332,32 @@ func (e *Engine) dispatch(ctx context.Context, rt *store.Route, body []byte, met
+ 	if filtered {
+ 		accounts = accountFilter[0](accounts)
+ 	}
++	if recoveryID, recovery := codexHTTPRecoveryAccount(ctx); recovery {
++		if e.CodexTransport != "ws" {
++			return &Result{StatusCode: http.StatusBadRequest, Error: "invalid_transport_recovery"}, nil
++		}
++		for i := range accounts {
++			if accounts[i].ID != recoveryID || !isCodexOAuth(&accounts[i]) {
++				continue
++			}
++			res, callErr := call(ctx, &accounts[i], body)
++			if callErr != nil && res == nil {
++				return nil, callErr
++			}
++			if res == nil {
++				return nil, nil
++			}
++			res.Attempts = 1
++			res.Strategy = string(router.Sequential)
++			res.SessionKey = meta.SessionKey
++			if res.SessionKey == "" {
++				res.SessionKey = SessionKey(meta.Header, body)
++			}
++			res.Failovers = nil
++			return res, nil
++		}
++		return &Result{StatusCode: http.StatusConflict, Error: "transport_recovery_account_unavailable"}, nil
++	}
+ 	if len(accounts) == 0 {
+ 		return e.emptyAccountsResult(ctx, rt, filtered)
+ 	}
+@@ -424,6 +478,40 @@ func (e *Engine) dispatch(ctx context.Context, rt *store.Route, body []byte, met
+ 	}
+ }
+ 
++// A cooldown alone does not prove subscription exhaustion. Require every seat
++// on this route to have a recent provider usage snapshot with a depleted,
++// not-yet-reset Codex window. Unknown, stale, or mixed accounts remain generic.
++func confirmedCodexQuotaExhausted(pool []store.Account, now time.Time) (time.Time, bool) {
++	if len(pool) == 0 {
++		return time.Time{}, false
++	}
++	var earliest time.Time
++	for _, a := range pool {
++		if !strings.EqualFold(a.Vendor, "codex") || !strings.EqualFold(a.AuthType, "oauth") || a.QuotaUpdatedAt == nil || a.QuotaUpdatedAt.After(now) || now.Sub(*a.QuotaUpdatedAt) > 10*time.Minute {
++			return time.Time{}, false
++		}
++		var seatReset time.Time
++		for _, window := range []struct {
++			pct   *float64
++			reset *time.Time
++		}{
++			{a.Quota5hRemainingPct, a.Quota5hResetAt},
++			{a.Quota7dRemainingPct, a.Quota7dResetAt},
++		} {
++			if window.pct != nil && *window.pct <= 0 && window.reset != nil && window.reset.After(now) && window.reset.After(seatReset) {
++				seatReset = *window.reset
++			}
++		}
++		if seatReset.IsZero() {
++			return time.Time{}, false
++		}
++		if earliest.IsZero() || seatReset.Before(earliest) {
++			earliest = seatReset
++		}
++	}
++	return earliest, true
++}
++
+ func (e *Engine) emptyAccountsResult(ctx context.Context, rt *store.Route, filtered bool) (*Result, error) {
+ 	if filtered {
+ 		body, _ := json.Marshal(map[string]string{
+@@ -443,6 +531,14 @@ func (e *Engine) emptyAccountsResult(ctx context.Context, rt *store.Route, filte
+ 		})
+ 		return &Result{StatusCode: http.StatusBadRequest, Body: body, Error: "no_accounts"}, nil
+ 	}
++	if resetAt, ok := confirmedCodexQuotaExhausted(pool, time.Now().UTC()); ok {
++		body, _ := json.Marshal(map[string]any{
++			"error":     "quota_exhausted",
++			"reset_at":  resetAt.Format(time.RFC3339),
++			"pool_size": len(pool),
++		})
++		return &Result{StatusCode: http.StatusServiceUnavailable, Body: body, Error: "quota_exhausted", Header: http.Header{"Content-Type": []string{"application/json"}}}, nil
++	}
+ 
+ 	retryAfter := 30
+ 	if until, ok, err := e.Store.EarliestRouteCooldown(ctx, rt.ID); err == nil && ok {
+@@ -711,6 +807,9 @@ func (e *Engine) doUpstream(ctx context.Context, acc *store.Account, body []byte
+ 
+ // doUpstreamOnce performs one upstream call; on oauth 401 with refresh_token, refreshes once and retries.
+ func (e *Engine) doUpstreamOnce(ctx context.Context, acc *store.Account, body []byte, url, authHeader, bearerPrefix string, openaiAuth bool, model string, stream bool, start time.Time, codexResponses bool, anthropicBridge bool) (*Result, error) {
++	if recoveryID, recovery := codexHTTPRecoveryAccount(ctx); recovery && (acc.ID != recoveryID || !isCodexOAuth(acc)) {
++		return &Result{StatusCode: http.StatusConflict, Error: "transport_recovery_account_unavailable", AccountID: acc.ID, Model: model}, nil
++	}
+ 	cred, token, err := e.loadCredential(ctx, acc)
+ 	if err != nil {
+ 		return &Result{StatusCode: http.StatusBadGateway, Error: err.Error(), AccountID: acc.ID, Latency: time.Since(start)}, err
+@@ -719,7 +818,7 @@ func (e *Engine) doUpstreamOnce(ctx context.Context, acc *store.Account, body []
+ 	if err != nil || res == nil {
+ 		return res, err
+ 	}
+-	if res.StatusCode != http.StatusUnauthorized || !strings.EqualFold(acc.AuthType, "oauth") || strings.TrimSpace(cred.RefreshToken) == "" {
++	if _, recovery := codexHTTPRecoveryAccount(ctx); recovery || res.StatusCode != http.StatusUnauthorized || !strings.EqualFold(acc.AuthType, "oauth") || strings.TrimSpace(cred.RefreshToken) == "" {
+ 		return res, nil
+ 	}
+ 	// Drain failed attempt body if still open.
+@@ -760,6 +859,10 @@ func (e *Engine) execUpstream(ctx context.Context, acc *store.Account, body []by
+ 		req.Header.Set("Accept", "text/event-stream")
+ 	}
+ 	applyUpstreamAuth(req, acc, cred, token, openaiAuth, authHeader, bearerPrefix)
++	_, recovering := codexHTTPRecoveryAccount(ctx)
++	if codexResponses && !recovering && e.CodexTransport == "ws" && strings.EqualFold(acc.Vendor, "codex") && strings.EqualFold(acc.AuthType, "oauth") {
++		return e.execCodexWebSocket(ctx, acc, body, req, model, stream, start)
++	}
+ 
+ 	client := e.HTTP
+ 	if client == nil {
+@@ -823,6 +926,7 @@ func (e *Engine) execUpstream(ctx context.Context, acc *store.Account, body []by
+ 	if codexResponses {
+ 		id := "chatcmpl-" + acc.ID.String()[:8]
+ 		opts := codexBridgeOpts{
++			upstreamTransport: "http", startedAt: start, requestContext: ctx, upstreamProtocol: res.Proto, requestID: res.Header.Get("X-Request-Id"), upstreamHTTPStatus: res.StatusCode, gatewayRequestID: gatewayRequestIDFromContext(ctx),
+ 			model:     model,
+ 			id:        id,
+ 			accountID: acc.ID.String(),
+diff --git a/internal/proxy/sports_desk_compat_test.go b/internal/proxy/sports_desk_compat_test.go
+new file mode 100644
+index 0000000..9969088
+--- /dev/null
++++ b/internal/proxy/sports_desk_compat_test.go
+@@ -0,0 +1,181 @@
++package proxy
++
++import (
++	"bytes"
++	"encoding/json"
++	"strings"
++	"testing"
++)
++
++func TestSportsDeskEffortAndLiveSearch(t *testing.T) {
++	for _, effort := range []string{"medium", "high", "xhigh"} {
++		in := []byte(`{"model":"gpt-6-astra","reasoning_effort":"` + effort + `","messages":[{"role":"user","content":"latest score"}],"tools":[{"type":"function","function":{"name":"web_search"}}],"tool_choice":"required","llms":{"web_search":{"mode":"live"}}}`)
++		out, _, _, err := chatToCodexResponses(in)
++		if err != nil {
++			t.Fatal(err)
++		}
++		var parsed map[string]any
++		if err := json.Unmarshal(out, &parsed); err != nil {
++			t.Fatal(err)
++		}
++		reasoning, _ := parsed["reasoning"].(map[string]any)
++		if reasoning["effort"] != effort {
++			t.Fatalf("effort %q: %s", effort, out)
++		}
++		include, _ := parsed["include"].([]any)
++		if len(include) != 1 || include[0] != "web_search_call.action.sources" {
++			t.Fatalf("search source inclusion: %s", out)
++		}
++		tools, _ := parsed["tools"].([]any)
++		if len(tools) != 1 || tools[0].(map[string]any)["external_web_access"] != true {
++			t.Fatalf("live search: %s", out)
++		}
++	}
++	for _, effort := range []string{"low", "max"} {
++		in := []byte(`{"reasoning_effort":"` + effort + `","messages":[{"role":"user","content":"hi"}]}`)
++		if _, _, _, err := chatToCodexResponses(in); err == nil {
++			t.Fatalf("accepted %q", effort)
++		}
++	}
++}
++
++func TestSportsDeskDisabledSearchOmitsSourceInclude(t *testing.T) {
++	in := []byte(`{"model":"gpt-6-astra","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"web_search"}}],"llms":{"web_search":{"mode":"disabled"}}}`)
++	out, _, _, err := chatToCodexResponses(in)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var parsed map[string]any
++	if err := json.Unmarshal(out, &parsed); err != nil {
++		t.Fatal(err)
++	}
++	if _, ok := parsed["include"]; ok {
++		t.Fatalf("disabled search source inclusion: %s", out)
++	}
++	if strings.Contains(string(out), "web_search") {
++		t.Fatalf("disabled search should be omitted: %s", out)
++	}
++}
++
++func TestSportsDeskTerminalStatuses(t *testing.T) {
++	cases := []struct{ name, event, want string }{
++		{"completed", `{"type":"response.completed","response":{"id":"resp_1","status":"completed"}}`, "completed"},
++		{"incomplete", `{"type":"response.incomplete","response":{"id":"resp_1","status":"incomplete"}}`, "incomplete"},
++		{"failed", `{"type":"response.failed","response":{"id":"resp_1","status":"failed"}}`, "failed"},
++		{"eof", "", "interrupted"},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			sse := "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n"
++			if tc.event != "" {
++				sse += "data: " + tc.event + "\n\n"
++			}
++			body, _, _, err := aggregateCodexSSE(strings.NewReader(sse), testBridgeOpts("gpt-6-astra", "chat_1"))
++			if err != nil {
++				t.Fatal(err)
++			}
++			var parsed map[string]any
++			if err := json.Unmarshal(body, &parsed); err != nil {
++				t.Fatal(err)
++			}
++			meta, _ := parsed["llms"].(map[string]any)
++			if meta["terminal"].(map[string]any)["status"] != tc.want {
++				t.Fatalf("status: %s", body)
++			}
++			if tc.event != "" && meta["terminal"].(map[string]any)["upstream_response_id"] != "resp_1" {
++				t.Fatalf("id: %s", body)
++			}
++			var stream bytes.Buffer
++			if _, _, _, err := convertCodexSSEToChat(strings.NewReader(sse), &stream, testBridgeOpts("gpt-6-astra", "chat_1")); err != nil {
++				t.Fatal(err)
++			}
++			if !strings.Contains(stream.String(), `"status":"`+tc.want+`"`) {
++				t.Fatalf("stream: %s", stream.String())
++			}
++		})
++	}
++}
++
++func TestSportsDeskSourcesAndAnnotations(t *testing.T) {
++	sse := `data: {"type":"response.completed","response":{"id":"resp_2","output":[{"type":"web_search_call","id":"ws_1","status":"completed","action":{"type":"search","sources":[{"url":"https://example.com/source","title":"Source"}]}},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Answer","annotations":[{"type":"url_citation","url":"https://example.com/cited","title":"Cited","start_index":0,"end_index":6}]}]}]}}
++
++`
++	body, _, _, err := aggregateCodexSSE(strings.NewReader(sse), testBridgeOpts("gpt-6-astra", "chat_1"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	var parsed map[string]any
++	if err := json.Unmarshal(body, &parsed); err != nil {
++		t.Fatal(err)
++	}
++	meta := parsed["llms"].(map[string]any)
++	hosted, _ := meta["hosted_tools"].([]any)
++	citations, _ := meta["citations"].([]any)
++	if len(hosted) != 1 || len(citations) != 1 {
++		t.Fatalf("sources/annotations: %s", body)
++	}
++	hostedTool, _ := hosted[0].(map[string]any)
++	action, _ := hostedTool["action"].(map[string]any)
++	sources, _ := action["sources"].([]any)
++	if len(sources) != 1 || sources[0].(map[string]any)["url"] != "https://example.com/source" {
++		t.Fatalf("hosted search sources: %s", body)
++	}
++	var stream bytes.Buffer
++	if _, _, _, err := convertCodexSSEToChat(strings.NewReader(sse), &stream, testBridgeOpts("gpt-6-astra", "chat_1")); err != nil {
++		t.Fatal(err)
++	}
++	if !strings.Contains(stream.String(), `"sources"`) || !strings.Contains(stream.String(), `"citations"`) {
++		t.Fatalf("stream metadata: %s", stream.String())
++	}
++}
++
++func TestSportsDeskResponseIDAndCitationBeforeInterruptedEOF(t *testing.T) {
++	sse := `data: {"type":"response.created","response":{"id":"resp_early"}}
++
++data: {"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Partial","annotations":[{"type":"url_citation","url":"https://example.com/early"}]}]}}
++
++`
++	body, _, _, err := aggregateCodexSSE(strings.NewReader(sse), testBridgeOpts("gpt-6-astra", "chat_1"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	var parsed map[string]any
++	if err := json.Unmarshal(body, &parsed); err != nil {
++		t.Fatal(err)
++	}
++	meta := parsed["llms"].(map[string]any)
++	terminal := meta["terminal"].(map[string]any)
++	if terminal["status"] != "interrupted" || terminal["upstream_response_id"] != "resp_early" {
++		t.Fatalf("terminal: %s", body)
++	}
++	citations, _ := meta["citations"].([]any)
++	if len(citations) != 1 {
++		t.Fatalf("citation: %s", body)
++	}
++}
++
++func TestSportsDeskPreservesUpstreamReportedModelAndReasoning(t *testing.T) {
++	sse := `data: {"type":"response.completed","response":{"id":"resp_model","model":"gpt-6-astra-2026-09-15","reasoning":{"mode":"adaptive","effort":"xhigh"},"status":"completed"}}
++
++`
++	body, _, _, err := aggregateCodexSSE(strings.NewReader(sse), testBridgeOpts("gpt-6-astra", "chat_1"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	var parsed map[string]any
++	if err := json.Unmarshal(body, &parsed); err != nil {
++		t.Fatal(err)
++	}
++	terminal := parsed["llms"].(map[string]any)["terminal"].(map[string]any)
++	if terminal["upstream_reported_model"] != "gpt-6-astra-2026-09-15" || terminal["upstream_reported_reasoning_mode"] != "adaptive" || terminal["upstream_reported_reasoning_effort"] != "xhigh" {
++		t.Fatalf("terminal metadata: %s", body)
++	}
++
++	var stream bytes.Buffer
++	if _, _, _, err := convertCodexSSEToChat(strings.NewReader(sse), &stream, testBridgeOpts("gpt-6-astra", "chat_1")); err != nil {
++		t.Fatal(err)
++	}
++	if !strings.Contains(stream.String(), `"upstream_reported_model":"gpt-6-astra-2026-09-15"`) || !strings.Contains(stream.String(), `"upstream_reported_reasoning_mode":"adaptive"`) || !strings.Contains(stream.String(), `"upstream_reported_reasoning_effort":"xhigh"`) {
++		t.Fatalf("stream metadata: %s", stream.String())
++	}
++}
+diff --git a/internal/proxy/sports_desk_diagnostics_test.go b/internal/proxy/sports_desk_diagnostics_test.go
+new file mode 100644
+index 0000000..be7ff6f
+--- /dev/null
++++ b/internal/proxy/sports_desk_diagnostics_test.go
+@@ -0,0 +1,114 @@
++package proxy
++
++import (
++	"bufio"
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net"
++	"strings"
++	"syscall"
++	"testing"
++	"time"
++)
++
++func TestSportsDeskSafeTransportDiagnostics(t *testing.T) {
++	for _, tc := range []struct {
++		name string
++		err  error
++		kind string
++	}{
++		{"deadline", context.DeadlineExceeded, "deadline_exceeded"},
++		{"cancelled", context.Canceled, "context_cancelled"},
++		{"unexpected_eof", io.ErrUnexpectedEOF, "unexpected_eof"},
++		{"wrapped_eof", fmt.Errorf("read wrapper: %w", io.EOF), "unexpected_eof"},
++		{"reset", syscall.ECONNRESET, "connection_reset"},
++		{"wrapped_reset", fmt.Errorf("secret-auth-token: %w", syscall.ECONNRESET), "connection_reset"},
++		{"closed", net.ErrClosed, "connection_closed"},
++		{"scanner", bufio.ErrTooLong, "scanner_token_too_long"},
++		{"unknown", errors.New("secret-auth-token https://private.invalid"), "unknown_transport_error"},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			body, _, _, err := aggregateCodexSSE(sportsErrorReader{strings.NewReader("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_diag\"}}\n\n"), tc.err}, testBridgeOpts("gpt-6-astra", "chat_1"))
++			if err != nil {
++				t.Fatal(err)
++			}
++			var obj map[string]any
++			json.Unmarshal(body, &obj)
++			terminal := obj["llms"].(map[string]any)["terminal"].(map[string]any)
++			if terminal["transport_error_kind"] != tc.kind || terminal["event_count"] != float64(1) {
++				t.Fatalf("diagnostics: %s", body)
++			}
++			diagnosticSubset, ok := terminal["diagnostics"].(map[string]any)
++			if !ok || diagnosticSubset["schema_version"] != float64(1) || diagnosticSubset["stage"] != "upstream_read" {
++				t.Fatalf("safe transport subset missing: %s", body)
++			}
++			if fingerprint, ok := diagnosticSubset["error_fingerprint"].(string); !ok || len(fingerprint) != 64 {
++				t.Fatalf("safe error fingerprint missing: %s", body)
++			}
++			for _, key := range []string{"upstream_elapsed_ms", "last_event_age_ms"} {
++				if value, ok := terminal[key].(float64); !ok || value < 0 || value > 86400000 {
++					t.Fatalf("unbounded %s: %s", key, body)
++				}
++			}
++			if strings.Contains(string(body), "secret-auth") || strings.Contains(string(body), "private.invalid") {
++				t.Fatal("raw error leaked")
++			}
++		})
++	}
++}
++func TestSportsDeskTopLevelErrorIsTerminal(t *testing.T) {
++	event := `data: {"type":"error","code":"server_error","message":"secret-error-body","param":"secret-param"}` + "\n\n"
++	body, _, _, err := aggregateCodexSSE(sportsErrorReader{strings.NewReader(event), io.ErrUnexpectedEOF}, testBridgeOpts("gpt-6-astra", "chat_1"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	var obj map[string]any
++	json.Unmarshal(body, &obj)
++	terminal := obj["llms"].(map[string]any)["terminal"].(map[string]any)
++	if terminal["status"] != "failed" || terminal["error"].(map[string]any)["code"] != "server_error" || strings.Contains(string(body), "secret-") {
++		t.Fatalf("terminal: %s", body)
++	}
++}
++
++func TestSportsDeskDiagnosticContextAndBounds(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	opts := testBridgeOpts("gpt-6-astra", "chat_1")
++	opts.requestContext = ctx
++	opts.startedAt = time.Now().Add(-48 * time.Hour)
++	opts.upstreamProtocol = "HTTP/2.0"
++	opts.requestID = "req_safe-123"
++	body, _, _, err := aggregateCodexSSE(strings.NewReader(""), opts)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var obj map[string]any
++	json.Unmarshal(body, &obj)
++	terminal := obj["llms"].(map[string]any)["terminal"].(map[string]any)
++	if terminal["request_context_cancelled"] != true || terminal["upstream_elapsed_ms"] != float64(86400000) || terminal["upstream_http_protocol"] != "HTTP/2.0" || terminal["request_id"] != "req_safe-123" {
++		t.Fatalf("diagnostics: %s", body)
++	}
++	opts.requestID = "secret://bad credential"
++	opts.upstreamProtocol = "secret-protocol"
++	body, _, _, _ = aggregateCodexSSE(strings.NewReader(""), opts)
++	if strings.Contains(string(body), "request_id") || strings.Contains(string(body), "upstream_http_protocol") || strings.Contains(string(body), "secret") {
++		t.Fatalf("unsafe header: %s", body)
++	}
++	for _, id := range []string{"", strings.Repeat("a", 129), "id\nheader", "ümlaut", "id.with-dot"} {
++		if safeUpstreamRequestID(id) != "" {
++			t.Fatalf("accepted unsafe id")
++		}
++	}
++}
++func TestSportsDeskActualScannerLimitDiagnostic(t *testing.T) {
++	body, _, _, err := aggregateCodexSSE(strings.NewReader("data: "+strings.Repeat("x", 8*1024*1024)), testBridgeOpts("gpt-6-astra", "chat_1"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !strings.Contains(string(body), "scanner_token_too_long") {
++		t.Fatalf("scanner diagnostic: %s", body)
++	}
++}
+diff --git a/internal/proxy/sports_desk_http_recovery_test.go b/internal/proxy/sports_desk_http_recovery_test.go
+new file mode 100644
+index 0000000..07cd345
+--- /dev/null
++++ b/internal/proxy/sports_desk_http_recovery_test.go
+@@ -0,0 +1,287 @@
++package proxy_test
++
++import (
++	"context"
++	"encoding/json"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"reflect"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/coder/websocket"
++	"github.com/goodtekxyz/openllms/internal/proxy"
++	"github.com/goodtekxyz/openllms/internal/secrets"
++	"github.com/goodtekxyz/openllms/internal/secrets/memory"
++	"github.com/goodtekxyz/openllms/internal/store"
++	"github.com/goodtekxyz/openllms/internal/vendor"
++	"github.com/goodtekxyz/openllms/internal/vendorauth"
++	"github.com/google/uuid"
++)
++
++func TestSportsDeskExplicitHTTPRecoveryUsesSameCodexAccount(t *testing.T) {
++	var handshakes, creates, httpPosts atomic.Int32
++	var wsCreate, httpRequestBody map[string]any
++	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if r.URL.Path != "/responses" {
++			http.NotFound(w, r)
++			return
++		}
++		if r.Header.Get("Authorization") != "Bearer recovery-test-token" || r.Header.Get("ChatGPT-Account-Id") != "recovery-account" {
++			t.Errorf("upstream identity changed: authorization=%t account=%q", r.Header.Get("Authorization") == "Bearer recovery-test-token", r.Header.Get("ChatGPT-Account-Id"))
++		}
++		if r.Method == http.MethodGet {
++			handshakes.Add(1)
++			w.Header().Set("X-Request-Id", "req_ws_recovery")
++			conn, err := websocket.Accept(w, r, nil)
++			if err != nil {
++				t.Errorf("accept websocket: %v", err)
++				return
++			}
++			defer conn.CloseNow()
++			ctx, cancel := context.WithTimeout(r.Context(), time.Second)
++			defer cancel()
++			_, payload, err := conn.Read(ctx)
++			if err != nil {
++				t.Errorf("read create: %v", err)
++				return
++			}
++			creates.Add(1)
++			var create map[string]any
++			if json.Unmarshal(payload, &create) != nil || create["type"] != "response.create" || create["reasoning"].(map[string]any)["effort"] != "xhigh" || !strings.Contains(string(payload), "recovery-full-input") {
++				t.Errorf("unexpected WS create: %s", payload)
++			}
++			wsCreate = create
++			_ = conn.Write(ctx, websocket.MessageText, []byte(`{"type":"response.created","response":{"id":"resp_ws_recovery"}}`))
++			_ = conn.Write(ctx, websocket.MessageText, []byte(`{"type":"response.output_text.delta","delta":"partial-only"}`))
++			// An abrupt connection loss after create reproduces an interrupted first generation.
++			return
++		}
++
++		httpPosts.Add(1)
++		if r.Method != http.MethodPost || r.Header.Get("Accept") != "text/event-stream" {
++			t.Errorf("recovery did not use Responses HTTP/SSE: method=%s accept=%q", r.Method, r.Header.Get("Accept"))
++		}
++		var body map[string]any
++		if json.NewDecoder(r.Body).Decode(&body) != nil || body["model"] != "gpt-6-astra" || body["reasoning"].(map[string]any)["effort"] != "xhigh" || !strings.Contains(mustJSON(body), "recovery-full-input") {
++			t.Errorf("HTTP recovery request semantics changed: %v", body)
++		}
++		httpRequestBody = body
++		w.Header().Set("Content-Type", "text/event-stream")
++		w.Header().Set("X-Request-Id", "req_http_recovery")
++		w.WriteHeader(http.StatusOK)
++		_, _ = io.WriteString(w, "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"web_search_call\",\"status\":\"completed\",\"action\":{\"type\":\"search\",\"sources\":[{\"url\":\"https://example.org/recovery-source\"}]}}}\n\n")
++		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_http_recovery\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"verified-final\"}]}]}}\n\n")
++	}))
++	defer up.Close()
++
++	sec := memory.New()
++	accountID := uuid.New()
++	path := vendor.InfisicalPath(uuid.New().String(), "codex", "recovery")
++	if err := sec.Put(context.Background(), path, vendor.SecretName, mustJSON(secrets.CredentialJSON{AccessToken: "recovery-test-token", ChatGPTAccountID: "recovery-account"})); err != nil {
++		t.Fatal(err)
++	}
++	acc := &store.Account{ID: accountID, Vendor: "codex", AuthType: "oauth", InfisicalPath: path, BaseURL: up.URL}
++	client := up.Client()
++	client.Timeout = time.Second
++	eng := &proxy.Engine{Secrets: sec, HTTP: client}
++	eng.CodexTransport = "ws"
++	requestBody := []byte(`{"model":"gpt-6-astra","reasoning_effort":"xhigh","stream":true,"messages":[{"role":"user","content":"recovery-full-input"}],"tools":[{"type":"function","function":{"name":"web_search"}}],"tool_choice":"required","llms":{"web_search":{"mode":"live"}}}`)
++
++	first, err := eng.CallAccountForTest(context.Background(), acc, requestBody)
++	if err != nil {
++		t.Fatal(err)
++	}
++	firstBody, err := io.ReadAll(first.Stream)
++	first.Stream.Close()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !strings.Contains(string(firstBody), "interrupted") || !strings.Contains(string(firstBody), "partial-only") {
++		t.Fatalf("first WS terminal did not preserve its partial interruption: %s", firstBody)
++	}
++
++	gatewayRequestID := uuid.NewString()
++	recoveryCtx := proxy.WithGatewayRequestID(context.Background(), gatewayRequestID)
++	recoveryCtx = proxy.WithCodexHTTPRecovery(recoveryCtx, accountID)
++	second, err := eng.CallAccountForTest(recoveryCtx, acc, requestBody)
++	if err != nil {
++		t.Fatal(err)
++	}
++	secondBody, err := io.ReadAll(second.Stream)
++	second.Stream.Close()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if handshakes.Load() != 1 || creates.Load() != 1 || httpPosts.Load() != 1 {
++		t.Fatalf("recovery call counts: ws_handshakes=%d ws_creates=%d http_posts=%d", handshakes.Load(), creates.Load(), httpPosts.Load())
++	}
++	delete(wsCreate, "type")
++	if !reflect.DeepEqual(wsCreate, httpRequestBody) {
++		t.Fatalf("recovery input diverged from the first create: ws=%s http=%s", mustJSON(wsCreate), mustJSON(httpRequestBody))
++	}
++	if !strings.Contains(string(secondBody), "verified-final") || !strings.Contains(string(secondBody), "https://example.org/recovery-source") || strings.Contains(string(secondBody), "partial-only") || !strings.Contains(string(secondBody), `"upstream_transport":"http"`) || !strings.Contains(string(secondBody), `"upstream_http_status":200`) || !strings.Contains(string(secondBody), `"gateway_request_id":"`+gatewayRequestID+`"`) || !strings.Contains(string(secondBody), "req_http_recovery") {
++		t.Fatalf("HTTP recovery terminal lost completion or safe diagnostics: %s", secondBody)
++	}
++
++	handshakes.Store(0)
++	creates.Store(0)
++	httpPosts.Store(0)
++	type callResult struct {
++		body []byte
++		err  error
++	}
++	results := make(chan callResult, 2)
++	go func() {
++		res, callErr := eng.CallAccountForTest(context.Background(), acc, requestBody)
++		if callErr != nil || res == nil || res.Stream == nil {
++			results <- callResult{err: callErr}
++			return
++		}
++		body, readErr := io.ReadAll(res.Stream)
++		res.Stream.Close()
++		results <- callResult{body: body, err: readErr}
++	}()
++	go func() {
++		ctx := proxy.WithCodexHTTPRecovery(context.Background(), accountID)
++		res, callErr := eng.CallAccountForTest(ctx, acc, requestBody)
++		if callErr != nil || res == nil || res.Stream == nil {
++			results <- callResult{err: callErr}
++			return
++		}
++		body, readErr := io.ReadAll(res.Stream)
++		res.Stream.Close()
++		results <- callResult{body: body, err: readErr}
++	}()
++	var concurrent []string
++	for i := 0; i < 2; i++ {
++		result := <-results
++		if result.err != nil {
++			t.Fatal(result.err)
++		}
++		concurrent = append(concurrent, string(result.body))
++	}
++	if handshakes.Load() != 1 || creates.Load() != 1 || httpPosts.Load() != 1 {
++		t.Fatalf("concurrent request-local transports leaked: ws_handshakes=%d ws_creates=%d http_posts=%d", handshakes.Load(), creates.Load(), httpPosts.Load())
++	}
++	hasPartial, hasHTTPFinal := false, false
++	for _, body := range concurrent {
++		hasPartial = hasPartial || strings.Contains(body, "partial-only")
++		hasHTTPFinal = hasHTTPFinal || strings.Contains(body, "verified-final")
++	}
++	if !hasPartial || !hasHTTPFinal {
++		t.Fatalf("concurrent calls did not retain distinct transport outcomes: %q", concurrent)
++	}
++}
++
++func TestSportsDeskHTTPRecoveryPinsAttachedAccountAndSuppressesFallback(t *testing.T) {
++	var pinnedCalls, alternateCalls atomic.Int32
++	var refreshCalls atomic.Int32
++	previousRefreshClient := vendorauth.HTTPClient
++	t.Cleanup(func() { vendorauth.HTTPClient = previousRefreshClient })
++	vendorauth.HTTPClient = &http.Client{Transport: recoveryRoundTripper(func(r *http.Request) (*http.Response, error) {
++		refreshCalls.Add(1)
++		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"access_token":"unexpected-refresh"}`)), Request: r}, nil
++	})}
++	pinnedUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		pinnedCalls.Add(1)
++		if r.Method != http.MethodPost || r.Header.Get("Authorization") != "Bearer pinned-token" {
++			t.Errorf("pinned account request mismatch: method=%s", r.Method)
++		}
++		var body struct {
++			Model string `json:"model"`
++		}
++		_ = json.NewDecoder(r.Body).Decode(&body)
++		switch body.Model {
++		case "failure-401":
++			w.WriteHeader(http.StatusUnauthorized)
++		case "failure-500":
++			w.WriteHeader(http.StatusInternalServerError)
++		case "failure-read-eof":
++			w.Header().Set("Content-Type", "text/event-stream")
++			_, _ = io.WriteString(w, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n")
++		default:
++			w.WriteHeader(http.StatusTooManyRequests)
++		}
++	}))
++	defer pinnedUpstream.Close()
++	alternateUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		alternateCalls.Add(1)
++		w.WriteHeader(http.StatusOK)
++		_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"wrong-account"}}]}`)
++	}))
++	defer alternateUpstream.Close()
++
++	sec := memory.New()
++	pinnedID, alternateID := uuid.New(), uuid.New()
++	pinnedPath := vendor.InfisicalPath(uuid.New().String(), "codex", "pinned")
++	alternatePath := vendor.InfisicalPath(uuid.New().String(), "openai", "paid-alternate")
++	if err := sec.Put(context.Background(), pinnedPath, vendor.SecretName, mustJSON(secrets.CredentialJSON{AccessToken: "pinned-token", RefreshToken: "must-not-refresh", ChatGPTAccountID: "pinned-chatgpt-account"})); err != nil {
++		t.Fatal(err)
++	}
++	if err := sec.Put(context.Background(), alternatePath, vendor.SecretName, mustJSON(secrets.CredentialJSON{APIKey: "alternate-paid-key"})); err != nil {
++		t.Fatal(err)
++	}
++	routeID := uuid.New()
++	fallbackID := uuid.New()
++	pinned := store.Account{ID: pinnedID, Vendor: "codex", AuthType: "oauth", InfisicalPath: pinnedPath, BaseURL: pinnedUpstream.URL}
++	alternate := store.Account{ID: alternateID, Vendor: "openai", AuthType: "api_key", InfisicalPath: alternatePath, BaseURL: alternateUpstream.URL + "/v1"}
++	fallbackRoute := &store.Route{ID: fallbackID, Strategy: "sequential"}
++	st := &memRouteStore{
++		accounts: []store.Account{alternate, pinned},
++		cool:     map[uuid.UUID]time.Time{},
++		routes:   map[string]*store.Route{"paid-fallback": fallbackRoute},
++	}
++	eng := &proxy.Engine{Store: st, Secrets: sec, HTTP: &http.Client{Timeout: time.Second}, Selector: nil, CodexTransport: "ws"}
++	rt := &store.Route{ID: routeID, Strategy: "parallel", Config: []byte(`{"parallel_allow_oauth":true,"fallback_slugs":["paid-fallback"]}`)}
++	st.byRoute = map[uuid.UUID][]store.Account{
++		routeID:    {alternate, pinned},
++		fallbackID: {alternate},
++	}
++	ctx := proxy.WithCodexHTTPRecovery(context.Background(), pinnedID)
++	res, err := eng.ChatCompletions(ctx, uuid.New(), rt, []byte(`{"model":"gpt-6-astra","stream":true,"messages":[{"role":"user","content":"same full request"}]}`), proxy.DispatchMeta{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if pinnedCalls.Load() != 1 || alternateCalls.Load() != 0 || res.AccountID != pinnedID || res.StatusCode != http.StatusTooManyRequests || res.Attempts != 1 || res.Strategy != "sequential" {
++		t.Fatalf("recovery escaped pinned single-account dispatch: pinned=%d alternate=%d account=%s status=%d attempts=%d strategy=%s", pinnedCalls.Load(), alternateCalls.Load(), res.AccountID, res.StatusCode, res.Attempts, res.Strategy)
++	}
++
++	missingCtx := proxy.WithCodexHTTPRecovery(context.Background(), uuid.New())
++	missing, err := eng.ChatCompletions(missingCtx, uuid.New(), rt, []byte(`{"model":"gpt-6-astra","messages":[]}`), proxy.DispatchMeta{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if missing.StatusCode != http.StatusConflict || missing.Error != "transport_recovery_account_unavailable" || pinnedCalls.Load() != 1 || alternateCalls.Load() != 0 {
++		t.Fatalf("missing pin did not fail closed: status=%d error=%q pinned=%d alternate=%d", missing.StatusCode, missing.Error, pinnedCalls.Load(), alternateCalls.Load())
++	}
++
++	for _, model := range []string{"failure-401", "failure-500", "failure-read-eof"} {
++		beforeCalls := pinnedCalls.Load()
++		body := []byte(`{"model":"` + model + `","stream":true,"messages":[{"role":"user","content":"same full request"}]}`)
++		failed, err := eng.ChatCompletions(ctx, uuid.New(), rt, body, proxy.DispatchMeta{})
++		if err != nil {
++			t.Fatalf("%s: %v", model, err)
++		}
++		if failed.Stream != nil {
++			streamBody, readErr := io.ReadAll(failed.Stream)
++			failed.Stream.Close()
++			if readErr != nil {
++				t.Fatalf("%s stream read: %v", model, readErr)
++			}
++			if model == "failure-read-eof" && !strings.Contains(string(streamBody), `"upstream_terminal_status":"interrupted"`) {
++				t.Fatalf("read EOF terminal missing: %s", streamBody)
++			}
++		}
++		if pinnedCalls.Load() != beforeCalls+1 || alternateCalls.Load() != 0 || refreshCalls.Load() != 0 || failed.AccountID != pinnedID || failed.Attempts != 1 {
++			t.Fatalf("%s recovery replayed or failed over: pinned=%d alternate=%d refresh=%d account=%s attempts=%d", model, pinnedCalls.Load()-beforeCalls, alternateCalls.Load(), refreshCalls.Load(), failed.AccountID, failed.Attempts)
++		}
++	}
++}
++
++type recoveryRoundTripper func(*http.Request) (*http.Response, error)
++
++func (f recoveryRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+diff --git a/internal/proxy/sports_desk_quota_test.go b/internal/proxy/sports_desk_quota_test.go
+new file mode 100644
+index 0000000..b26c993
+--- /dev/null
++++ b/internal/proxy/sports_desk_quota_test.go
+@@ -0,0 +1,58 @@
++package proxy_test
++
++import (
++	"context"
++	"encoding/json"
++	"testing"
++	"time"
++
++	"github.com/goodtekxyz/openllms/internal/proxy"
++	"github.com/goodtekxyz/openllms/internal/store"
++	"github.com/google/uuid"
++)
++
++func TestSportsDeskQuotaExhaustedOnlyFromFreshCodexUsage(t *testing.T) {
++	now := time.Now().UTC()
++	zero, available := 0.0, 20.0
++	reset := now.Add(90 * time.Minute)
++	fresh := now.Add(-time.Minute)
++	stale := now.Add(-30 * time.Minute)
++	cases := []struct {
++		name     string
++		accounts []store.Account
++		want     string
++	}{
++		{"fresh depleted Codex seats", []store.Account{{ID: uuid.New(), Vendor: "codex", AuthType: "oauth", QuotaUpdatedAt: &fresh, Quota5hRemainingPct: &zero, Quota5hResetAt: &reset}, {ID: uuid.New(), Vendor: "codex", AuthType: "oauth", QuotaUpdatedAt: &fresh, Quota7dRemainingPct: &zero, Quota7dResetAt: &reset}}, "quota_exhausted"},
++		{"transient 429 cooldown", []store.Account{{ID: uuid.New(), Vendor: "codex", AuthType: "oauth", QuotaUpdatedAt: &fresh, Quota5hRemainingPct: &available, Quota5hResetAt: &reset}}, "no_usable_accounts"},
++		{"stale depleted usage", []store.Account{{ID: uuid.New(), Vendor: "codex", AuthType: "oauth", QuotaUpdatedAt: &stale, Quota5hRemainingPct: &zero, Quota5hResetAt: &reset}}, "no_usable_accounts"},
++		{"unknown seat", []store.Account{{ID: uuid.New(), Vendor: "codex", AuthType: "oauth"}}, "no_usable_accounts"},
++		{"mixed route", []store.Account{{ID: uuid.New(), Vendor: "codex", AuthType: "oauth", QuotaUpdatedAt: &fresh, Quota5hRemainingPct: &zero, Quota5hResetAt: &reset}, {ID: uuid.New(), Vendor: "openai", AuthType: "api_key"}}, "no_usable_accounts"},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			st := &memRouteStore{accounts: tc.accounts, cool: map[uuid.UUID]time.Time{}}
++			for _, a := range tc.accounts {
++				st.cool[a.ID] = now.Add(time.Minute)
++			}
++			rt := &store.Route{ID: uuid.New(), ProjectID: uuid.New(), Slug: "sports", Strategy: "sequential"}
++			eng := &proxy.Engine{Store: st}
++			res, err := eng.ChatCompletions(context.Background(), rt.ProjectID, rt, []byte(`{"model":"gpt-6-astra","messages":[]}`), proxy.DispatchMeta{})
++			if err != nil {
++				t.Fatal(err)
++			}
++			if res.Error != tc.want {
++				t.Fatalf("got error=%s body=%s", res.Error, res.Body)
++			}
++			var body map[string]any
++			if err := json.Unmarshal(res.Body, &body); err != nil {
++				t.Fatal(err)
++			}
++			if body["error"] != tc.want {
++				t.Fatalf("body=%s", res.Body)
++			}
++			if tc.want == "quota_exhausted" && body["reset_at"] == nil {
++				t.Fatalf("missing reset_at: %s", res.Body)
++			}
++		})
++	}
++}
+diff --git a/internal/proxy/sports_desk_timeout_engine_test.go b/internal/proxy/sports_desk_timeout_engine_test.go
+new file mode 100644
+index 0000000..1b760fb
+--- /dev/null
++++ b/internal/proxy/sports_desk_timeout_engine_test.go
+@@ -0,0 +1,111 @@
++package proxy_test
++
++import (
++	"context"
++	"encoding/json"
++	"github.com/goodtekxyz/openllms/internal/proxy"
++	"github.com/goodtekxyz/openllms/internal/router"
++	"github.com/goodtekxyz/openllms/internal/secrets"
++	"github.com/goodtekxyz/openllms/internal/secrets/memory"
++	"github.com/goodtekxyz/openllms/internal/store"
++	"github.com/goodtekxyz/openllms/internal/vendor"
++	"github.com/google/uuid"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++func TestSportsDeskAcceptedExecutionNeverRetries(t *testing.T) {
++	for _, tc := range []struct {
++		name                    string
++		timeout, timeToComplete time.Duration
++		want                    string
++		http2                   bool
++	}{
++		{"after_former_budget", 300 * time.Millisecond, 80 * time.Millisecond, "completed", false},
++		{"new_deadline", 40 * time.Millisecond, 150 * time.Millisecond, "upstream_timeout", false},
++		{"missing_terminal", 300 * time.Millisecond, 0, "upstream_eof", false},
++		{"http2_completed", 300 * time.Millisecond, 30 * time.Millisecond, "completed", true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			var calls atomic.Int32
++			up := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				calls.Add(1)
++				var input map[string]any
++				json.NewDecoder(r.Body).Decode(&input)
++				if input["reasoning"].(map[string]any)["effort"] != "xhigh" || input["tools"].([]any)[0].(map[string]any)["external_web_access"] != true {
++					t.Error("request semantics lost")
++				}
++				w.Header().Set("Content-Type", "text/event-stream")
++				w.Header().Set("X-Request-Id", "req_safe_123")
++				io.WriteString(w, "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_local\"}}\n\n")
++				w.(http.Flusher).Flush()
++				if tc.timeToComplete == 0 {
++					return
++				}
++				select {
++				case <-r.Context().Done():
++					return
++				case <-time.After(tc.timeToComplete):
++				}
++				io.WriteString(w, "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"web_search_call\",\"id\":\"search_1\",\"status\":\"completed\",\"action\":{\"type\":\"search\",\"sources\":[{\"url\":\"https://example.org/source\"}]}}}\n\n")
++				io.WriteString(w, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"result\"}\n\n")
++				io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_local\",\"reasoning\":{\"effort\":\"xhigh\"}}}\n\n")
++				w.(http.Flusher).Flush()
++				<-r.Context().Done() // terminal must finish without waiting for EOF
++			}))
++			if tc.http2 {
++				up.EnableHTTP2 = true
++				up.StartTLS()
++			} else {
++				up.Start()
++			}
++			defer up.Close()
++			sec := memory.New()
++			accounts := []store.Account{}
++			for i := 0; i < 2; i++ {
++				id := uuid.New()
++				path := vendor.InfisicalPath(uuid.New().String(), "codex", "local")
++				sec.Put(context.Background(), path, vendor.SecretName, mustJSON(secrets.CredentialJSON{AccessToken: "local-test-token"}))
++				accounts = append(accounts, store.Account{ID: id, InfisicalPath: path, BaseURL: up.URL, Vendor: "codex", AuthType: "oauth", Weight: 1, Position: i})
++			}
++			st := &memRouteStore{accounts: accounts, cool: map[uuid.UUID]time.Time{}}
++			client := up.Client()
++			client.Timeout = tc.timeout
++			eng := &proxy.Engine{Store: st, Secrets: sec, HTTP: client, Selector: router.NewSelector()}
++			rt := &store.Route{ID: uuid.New(), Strategy: string(router.Sequential)}
++			res, err := eng.ChatCompletions(context.Background(), uuid.New(), rt, []byte(`{"model":"gpt-6-astra","reasoning_effort":"xhigh","stream":true,"messages":[{"role":"user","content":"local"}],"tools":[{"type":"function","function":{"name":"web_search"}}],"tool_choice":"required","llms":{"web_search":{"mode":"live"}}}`), proxy.DispatchMeta{})
++			if err != nil {
++				t.Fatal(err)
++			}
++			if res.Stream == nil {
++				t.Fatalf("no stream: %s", res.Error)
++			}
++			body, err := io.ReadAll(res.Stream)
++			res.Stream.Close()
++			if err != nil {
++				t.Fatal(err)
++			}
++			protocol := "HTTP/1.1"
++			if tc.http2 {
++				protocol = "HTTP/2.0"
++			}
++			if !strings.Contains(string(body), protocol) || !strings.Contains(string(body), "req_safe_123") {
++				t.Fatalf("HTTP diagnostics missing: %s", body)
++			}
++			if calls.Load() != 1 || res.Attempts != 1 {
++				t.Fatalf("execution replayed calls=%d attempts=%d", calls.Load(), res.Attempts)
++			}
++			if !strings.Contains(string(body), tc.want) || !strings.Contains(string(body), "resp_local") {
++				t.Fatalf("terminal: %s", body)
++			}
++			if tc.want == "completed" && (!strings.Contains(string(body), "https://example.org/source") || !strings.Contains(string(body), "xhigh")) {
++				t.Fatalf("metadata lost: %s", body)
++			}
++		})
++	}
++}
+diff --git a/internal/proxy/sports_desk_timeout_test.go b/internal/proxy/sports_desk_timeout_test.go
+new file mode 100644
+index 0000000..8244e95
+--- /dev/null
++++ b/internal/proxy/sports_desk_timeout_test.go
+@@ -0,0 +1,80 @@
++package proxy
++
++import (
++	"context"
++	"encoding/json"
++	"io"
++	"strings"
++	"testing"
++)
++
++type sportsErrorReader struct {
++	io.Reader
++	err error
++}
++
++func (r sportsErrorReader) Read(p []byte) (int, error) {
++	n, e := r.Reader.Read(p)
++	if e == io.EOF {
++		return n, r.err
++	}
++	return n, e
++}
++func TestSportsDeskInterruptedTransportTerminal(t *testing.T) {
++	for _, tc := range []struct {
++		name string
++		err  error
++		code string
++	}{
++		{"deadline", context.DeadlineExceeded, "upstream_timeout"},
++		{"transport", io.ErrUnexpectedEOF, "upstream_transport_error"},
++		{"eof", io.EOF, "upstream_eof"},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			r := sportsErrorReader{strings.NewReader("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_early\"}}\n\n"), tc.err}
++			stream := startCodexChatPipe(io.NopCloser(r), testBridgeOpts("gpt-6-astra", "chat_1"))
++			out, retryable, err := awaitCommit(stream)
++			if err != nil || retryable {
++				t.Fatalf("accepted execution retried: %v %v", retryable, err)
++			}
++			defer out.Close()
++			body, err := io.ReadAll(out)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if !strings.Contains(string(body), tc.code) || !strings.Contains(string(body), "resp_early") || !strings.Contains(string(body), "[DONE]") {
++				t.Fatalf("terminal missing: %s", body)
++			}
++		})
++	}
++}
++func TestSportsDeskCompletedStopsBeforeReadError(t *testing.T) {
++	r := sportsErrorReader{strings.NewReader("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_ok\"}}\n\n"), io.ErrUnexpectedEOF}
++	body, _, _, err := aggregateCodexSSE(r, testBridgeOpts("gpt-6-astra", "chat_1"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	var obj map[string]any
++	json.Unmarshal(body, &obj)
++	if obj["llms"].(map[string]any)["terminal"].(map[string]any)["status"] != "completed" {
++		t.Fatalf("terminal: %s", body)
++	}
++}
++
++func TestSportsDeskExplicitTerminalPreservedWithoutUnsafeError(t *testing.T) {
++	for _, status := range []string{"failed", "incomplete", "cancelled"} {
++		t.Run(status, func(t *testing.T) {
++			event := `data: {"type":"response.` + status + `","response":{"id":"resp_explicit","error":{"code":"server_error","message":"secret-credential","payload":"secret-payload"}}}` + "\n\n"
++			body, _, _, err := aggregateCodexSSE(strings.NewReader(event), testBridgeOpts("gpt-6-astra", "chat_1"))
++			if err != nil {
++				t.Fatal(err)
++			}
++			var obj map[string]any
++			json.Unmarshal(body, &obj)
++			terminal := obj["llms"].(map[string]any)["terminal"].(map[string]any)
++			if terminal["status"] != status || terminal["error"].(map[string]any)["code"] != "server_error" || strings.Contains(string(body), "secret-") {
++				t.Fatalf("unsafe terminal: %s", body)
++			}
++		})
++	}
++}
+diff --git a/internal/proxy/sports_desk_websocket_engine_test.go b/internal/proxy/sports_desk_websocket_engine_test.go
+new file mode 100644
+index 0000000..6d51f7d
+--- /dev/null
++++ b/internal/proxy/sports_desk_websocket_engine_test.go
+@@ -0,0 +1,134 @@
++package proxy_test
++
++import (
++	"context"
++	"encoding/json"
++	"github.com/coder/websocket"
++	"github.com/goodtekxyz/openllms/internal/proxy"
++	"github.com/goodtekxyz/openllms/internal/router"
++	"github.com/goodtekxyz/openllms/internal/secrets"
++	"github.com/goodtekxyz/openllms/internal/secrets/memory"
++	"github.com/goodtekxyz/openllms/internal/store"
++	"github.com/goodtekxyz/openllms/internal/vendor"
++	"github.com/google/uuid"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++func TestSportsDeskWebSocketSingleCreateAndParity(t *testing.T) {
++	for _, tc := range []struct{ name, want string }{
++		{"completed_open", "completed"}, {"aggregate_completed", "completed"}, {"parallel_missing_terminal", "upstream_eof"}, {"completed_closed", "completed"}, {"missing_terminal", "upstream_eof"}, {"deadline", "upstream_timeout"}, {"closed_after_create", "interrupted"}, {"explicit_error", "failed"},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			var handshakes, creates, httpPosts atomic.Int32
++			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				if r.Method != "GET" {
++					httpPosts.Add(1)
++					http.Error(w, "HTTP fallback", 400)
++					return
++				}
++				handshakes.Add(1)
++				if r.Header.Get("Authorization") != "Bearer local-ws-test" || r.Header.Get("ChatGPT-Account-Id") != "local-account" || r.Header.Get("OpenAI-Beta") != "responses_websockets=2026-02-06" {
++					t.Error("WS authentication changed")
++				}
++				w.Header().Set("X-Request-Id", "req_ws_safe")
++				conn, err := websocket.Accept(w, r, nil)
++				if err != nil {
++					t.Error(err)
++					return
++				}
++				defer conn.CloseNow()
++				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++				defer cancel()
++				_, payload, err := conn.Read(ctx)
++				if err != nil {
++					t.Error(err)
++					return
++				}
++				creates.Add(1)
++				var got map[string]any
++				json.Unmarshal(payload, &got)
++				if got["type"] != "response.create" || got["model"] != "gpt-6-astra" || got["stream"] != true || got["reasoning"].(map[string]any)["effort"] != "xhigh" || got["tool_choice"].(map[string]any)["type"] != "web_search" || got["include"].([]any)[0] != "web_search_call.action.sources" || got["tools"].([]any)[0].(map[string]any)["external_web_access"] != true || !strings.Contains(string(payload), "full-context-marker") {
++					t.Fatalf("create semantics: %s", payload)
++				}
++				if tc.name == "closed_after_create" {
++					return
++				}
++				conn.Write(ctx, websocket.MessageText, []byte(`{"type":"response.created","response":{"id":"resp_ws"}}`))
++				if tc.name == "deadline" {
++					conn.Read(ctx)
++					return
++				}
++				if tc.name == "missing_terminal" || tc.name == "parallel_missing_terminal" {
++					conn.Close(websocket.StatusNormalClosure, "")
++					return
++				}
++				if tc.name == "explicit_error" {
++					conn.Write(ctx, websocket.MessageText, []byte(`{"type":"error","code":"server_error","message":"secret-message"}`))
++					conn.Read(ctx)
++					return
++				}
++				conn.Write(ctx, websocket.MessageText, []byte(`{"type":"response.output_item.done","item":{"id":"search_ws","type":"web_search_call","status":"completed","action":{"type":"search","sources":[{"url":"https://example.org/ws-source"}]}}}`))
++				conn.Write(ctx, websocket.MessageText, []byte("{\n\"type\":\"response.completed\",\"response\":{\"id\":\"resp_ws\",\"reasoning\":{\"effort\":\"xhigh\"},\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"result\"}]}]}}"))
++				if tc.name == "completed_closed" {
++					conn.Close(websocket.StatusNormalClosure, "")
++					return
++				}
++				conn.Read(ctx) // completed must close promptly without waiting for EOF
++			}))
++			defer up.Close()
++			sec := memory.New()
++			accounts := []store.Account{}
++			for i := 0; i < 2; i++ {
++				id := uuid.New()
++				path := vendor.InfisicalPath(uuid.New().String(), "codex", "local-ws")
++				sec.Put(context.Background(), path, vendor.SecretName, mustJSON(secrets.CredentialJSON{AccessToken: "local-ws-test", ChatGPTAccountID: "local-account"}))
++				accounts = append(accounts, store.Account{ID: id, InfisicalPath: path, BaseURL: up.URL, Vendor: "codex", AuthType: "oauth", Weight: 1, Position: i})
++			}
++			client := up.Client()
++			client.Timeout = 150 * time.Millisecond
++			eng := &proxy.Engine{Store: &memRouteStore{accounts: accounts, cool: map[uuid.UUID]time.Time{}}, Secrets: sec, HTTP: client, Selector: router.NewSelector()}
++			eng.CodexTransport = "ws"
++			started := time.Now()
++			rt := &store.Route{ID: uuid.New(), Strategy: string(router.Sequential)}
++			if strings.HasPrefix(tc.name, "parallel") {
++				rt.Strategy = string(router.Parallel)
++				rt.Config = []byte(`{"parallel_allow_oauth":true}`)
++			}
++			requestBody := []byte(`{"model":"gpt-6-astra","reasoning_effort":"xhigh","stream":true,"messages":[{"role":"user","content":"full-context-marker"}],"tools":[{"type":"function","function":{"name":"web_search"}}],"tool_choice":"required","llms":{"web_search":{"mode":"live"}}}`)
++			if tc.name == "aggregate_completed" {
++				requestBody = []byte(strings.Replace(string(requestBody), `"stream":true`, `"stream":false`, 1))
++			}
++			gatewayRequestID := uuid.NewString()
++			res, err := eng.ChatCompletions(proxy.WithGatewayRequestID(context.Background(), gatewayRequestID), uuid.New(), rt, requestBody, proxy.DispatchMeta{})
++			if err != nil {
++				t.Fatal(err)
++			}
++			body := res.Body
++			if tc.name != "aggregate_completed" {
++				if res.Stream == nil {
++					t.Fatalf("no WS stream: %s", res.Error)
++				}
++				body, err = io.ReadAll(res.Stream)
++				res.Stream.Close()
++			}
++			if err != nil {
++				t.Fatal(err)
++			}
++			if creates.Load() != 1 || handshakes.Load() != 1 || httpPosts.Load() != 0 || res.Attempts != 1 {
++				t.Fatalf("replayed execution creates=%d handshakes=%d HTTP=%d attempts=%d", creates.Load(), handshakes.Load(), httpPosts.Load(), res.Attempts)
++			}
++			if !strings.Contains(string(body), tc.want) || !strings.Contains(string(body), `"upstream_transport":"ws"`) || !strings.Contains(string(body), `"gateway_request_id":"`+gatewayRequestID+`"`) || !strings.Contains(string(body), `"schema_version":1`) || strings.Contains(string(body), "secret-message") {
++				t.Fatalf("terminal: %s", body)
++			}
++			if tc.want == "completed" && (time.Since(started) > 100*time.Millisecond || !strings.Contains(string(body), "https://example.org/ws-source")) {
++				t.Fatalf("completion/source delayed or lost: %s", body)
++			}
++		})
++	}
++}
+diff --git a/internal/proxy/sports_desk_websocket_test.go b/internal/proxy/sports_desk_websocket_test.go
+new file mode 100644
+index 0000000..a5585bd
+--- /dev/null
++++ b/internal/proxy/sports_desk_websocket_test.go
+@@ -0,0 +1,211 @@
++package proxy
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"github.com/coder/websocket"
++	"github.com/goodtekxyz/openllms/internal/secrets"
++	"github.com/goodtekxyz/openllms/internal/secrets/memory"
++	"github.com/goodtekxyz/openllms/internal/store"
++	"github.com/goodtekxyz/openllms/internal/vendor"
++	"github.com/goodtekxyz/openllms/internal/vendorauth"
++	"github.com/google/uuid"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++type sportsWSWriteFail struct{ writes, reads, closes int }
++
++func (c *sportsWSWriteFail) Write(context.Context, websocket.MessageType, []byte) error {
++	c.writes++
++	return errors.New("secret-partial-write")
++}
++func (c *sportsWSWriteFail) Read(context.Context) (websocket.MessageType, []byte, error) {
++	c.reads++
++	return 0, nil, io.EOF
++}
++func (c *sportsWSWriteFail) CloseNow() error { c.closes++; return nil }
++func TestSportsDeskWebSocketPartialWriteCommits(t *testing.T) {
++	conn := &sportsWSWriteFail{}
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	pipe := startCodexChatPipe(startCodexWSCreate(ctx, cancel, conn, []byte(`{"type":"response.create"}`)), testBridgeOpts("gpt-6-astra", "chat_1"))
++	out, retry, err := awaitCommit(pipe)
++	if err != nil || retry {
++		t.Fatalf("partial write replayed: %v %v", retry, err)
++	}
++	body, err := io.ReadAll(out)
++	out.Close()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if conn.writes != 1 || conn.reads != 0 || !strings.Contains(string(body), "interrupted") || strings.Contains(string(body), "secret-") {
++		t.Fatalf("unsafe write result: %s", body)
++	}
++	if !strings.Contains(string(body), `"stage":"upstream_create_write"`) || !strings.Contains(string(body), `"error_origin":"gateway_upstream"`) || strings.Contains(string(body), "secret-partial-write") {
++		t.Fatalf("create-write diagnostics unsafe or missing: %s", body)
++	}
++}
++func TestSportsDeskCloseCancelsWebSocketRead(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	conn := &sportsWSBlocking{ctx: ctx}
++	pipe := startCodexChatPipe(startCodexWSCreate(ctx, cancel, conn, []byte(`{}`)), testBridgeOpts("gpt-6-astra", "chat_1"))
++	done := make(chan struct{})
++	go func() { pipe.Close(); close(done) }()
++	select {
++	case <-done:
++	case <-time.After(time.Second):
++		t.Fatal("close left upstream read blocked")
++	}
++}
++
++type sportsWSBlocking struct{ ctx context.Context }
++
++func (c *sportsWSBlocking) Write(context.Context, websocket.MessageType, []byte) error { return nil }
++func (c *sportsWSBlocking) Read(context.Context) (websocket.MessageType, []byte, error) {
++	<-c.ctx.Done()
++	return 0, nil, c.ctx.Err()
++}
++func (c *sportsWSBlocking) CloseNow() error { return nil }
++
++func TestSportsDeskWebSocketHandshakeOnlyAndRedirectSafe(t *testing.T) {
++	var messages, redirectHits atomic.Int32
++	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		redirectHits.Add(1)
++		http.Error(w, "secret-redirect-body", 400)
++	}))
++	defer target.Close()
++	for _, redirect := range []bool{false, true} {
++		t.Run(fmt.Sprint(redirect), func(t *testing.T) {
++			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				if redirect {
++					http.Redirect(w, r, target.URL, http.StatusFound)
++					return
++				}
++				conn, err := websocket.Accept(w, r, nil)
++				if err != nil {
++					t.Error(err)
++					return
++				}
++				defer conn.CloseNow()
++				_, _, err = conn.Read(context.Background())
++				if err == nil {
++					messages.Add(1)
++				}
++			}))
++			defer up.Close()
++			req, _ := http.NewRequest(http.MethodGet, up.URL+"/responses", nil)
++			req.Header.Set("Authorization", "Bearer secret-local-test")
++			result := probeCodexWebSocket(context.Background(), req, up.Client())
++			if result.OK == redirect || messages.Load() != 0 || redirectHits.Load() != 0 {
++				t.Fatalf("unsafe probe: %+v", result)
++			}
++			encoded, _ := json.Marshal(result)
++			if strings.Contains(string(encoded), "secret") || strings.Contains(string(encoded), target.URL) {
++				t.Fatalf("unsafe probe output")
++			}
++		})
++	}
++}
++func TestSportsDeskWebSocketProbeRejectsUntrustedTargetBeforeSecrets(t *testing.T) {
++	engine := &Engine{} // no secret client: rejection must happen before retrieval
++	for _, base := range []string{"https://evil.invalid/backend-api/codex", "http://chatgpt.com/backend-api/codex", "https://user:secret@chatgpt.com/backend-api/codex", "https://chatgpt.com:443/backend-api/codex", "https://chatgpt.com/backend-api/codex?secret=1"} {
++		result := engine.CheckCodexWebSocketHandshake(context.Background(), &store.Account{Vendor: "codex", AuthType: "oauth", BaseURL: base})
++		if result.ErrorCode != "unsafe_target" {
++			t.Fatalf("target accepted")
++		}
++	}
++}
++func TestSportsDeskWebSocket401RefreshBeforeOnlyCreate(t *testing.T) {
++	var handshakes, creates, refreshes atomic.Int32
++	token := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		refreshes.Add(1)
++		io.WriteString(w, `{"access_token":"new-test-token","refresh_token":"new-test-refresh","expires_in":3600}`)
++	}))
++	defer token.Close()
++	oldURL, oldHTTP := vendorauth.CodexTokenURL, vendorauth.HTTPClient
++	vendorauth.CodexTokenURL = token.URL
++	vendorauth.HTTPClient = token.Client()
++	defer func() { vendorauth.CodexTokenURL = oldURL; vendorauth.HTTPClient = oldHTTP }()
++	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		handshakes.Add(1)
++		if r.Header.Get("Authorization") == "Bearer old-test-token" {
++			w.WriteHeader(401)
++			io.WriteString(w, "secret-auth-error-body")
++			return
++		}
++		conn, err := websocket.Accept(w, r, nil)
++		if err != nil {
++			t.Error(err)
++			return
++		}
++		defer conn.CloseNow()
++		_, _, err = conn.Read(context.Background())
++		if err != nil {
++			t.Error(err)
++			return
++		}
++		creates.Add(1)
++		conn.Write(context.Background(), websocket.MessageText, []byte(`{"type":"response.completed","response":{"id":"resp_auth"}}`))
++		conn.Read(context.Background())
++	}))
++	defer up.Close()
++	sec := memory.New()
++	path := "/local/ws/auth"
++	raw, _ := json.Marshal(secrets.CredentialJSON{AccessToken: "old-test-token", RefreshToken: "old-test-refresh"})
++	sec.Put(context.Background(), path, vendor.SecretName, string(raw))
++	engine := &Engine{Secrets: sec, HTTP: up.Client(), CodexTransport: "ws"}
++	acc := &store.Account{ID: uuid.New(), Vendor: "codex", AuthType: "oauth", InfisicalPath: path, BaseURL: up.URL}
++	result, err := engine.callResponsesBridge(context.Background(), acc, []byte(`{"model":"gpt-6-astra","stream":true,"messages":[{"role":"user","content":"local"}]}`))
++	if err != nil {
++		t.Fatal(err)
++	}
++	body, err := io.ReadAll(result.Stream)
++	result.Stream.Close()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if handshakes.Load() != 2 || creates.Load() != 1 || refreshes.Load() != 1 || !strings.Contains(string(body), "completed") || strings.Contains(string(body), "secret-auth") {
++		t.Fatalf("unsafe auth replay: %s", body)
++	}
++}
++func TestSportsDeskNestedWebSocketErrorSafeCode(t *testing.T) {
++	body, _, _, err := aggregateCodexSSE(strings.NewReader("data: "+`{"type":"error","error":{"code":"server_error","message":"secret-nested"}}`+"\n\n"), testBridgeOpts("gpt-6-astra", "chat_1"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !strings.Contains(string(body), "server_error") || strings.Contains(string(body), "secret-nested") {
++		t.Fatalf("unsafe error: %s", body)
++	}
++}
++
++func TestSportsDeskWebSocketOptionOnlyCodexOAuth(t *testing.T) {
++	for _, acc := range []store.Account{{ID: uuid.New(), Vendor: "openai", AuthType: "oauth", InfisicalPath: "/local/http"}, {ID: uuid.New(), Vendor: "codex", AuthType: "api_key", InfisicalPath: "/local/http"}} {
++		var posts atomic.Int32
++		up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			if r.Method != http.MethodPost {
++				t.Error("non-Codex-OAuth used WS")
++			}
++			posts.Add(1)
++			w.Header().Set("Content-Type", "text/event-stream")
++			io.WriteString(w, "data: "+`{"type":"response.completed","response":{"id":"resp_http"}}`+"\n\n")
++		}))
++		sec := memory.New()
++		raw, _ := json.Marshal(secrets.CredentialJSON{APIKey: "local-api", AccessToken: "local-oauth"})
++		sec.Put(context.Background(), acc.InfisicalPath, vendor.SecretName, string(raw))
++		acc.BaseURL = up.URL
++		eng := &Engine{Secrets: sec, HTTP: up.Client(), CodexTransport: "ws"}
++		res, err := eng.callResponsesBridge(context.Background(), &acc, []byte(`{"model":"gpt-6-astra","messages":[{"role":"user","content":"local"}]}`))
++		if err != nil || res.StatusCode != 200 || posts.Load() != 1 || !strings.Contains(string(res.Body), `"upstream_transport":"http"`) {
++			t.Fatalf("HTTP scope changed")
++		}
++		up.Close()
++	}
++}
+diff --git a/internal/proxy/sports_transport_diagnostics_test.go b/internal/proxy/sports_transport_diagnostics_test.go
+new file mode 100644
+index 0000000..c210892
+--- /dev/null
++++ b/internal/proxy/sports_transport_diagnostics_test.go
+@@ -0,0 +1,152 @@
++package proxy
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/coder/websocket"
++)
++
++func TestSportsDeskWebSocketCloseAndReadLimitDiagnostics(t *testing.T) {
++	cases := []struct {
++		name          string
++		closeCode     websocket.StatusCode
++		oversize      bool
++		protocolError bool
++		abrupt        bool
++		binaryFrame   bool
++		wantError     string
++	}{
++		{name: "normal_close", closeCode: websocket.StatusNormalClosure, wantError: "upstream_eof"},
++		{name: "going_away", closeCode: websocket.StatusGoingAway, wantError: "upstream_eof"},
++		{name: "internal_error", closeCode: websocket.StatusInternalError, wantError: "upstream_transport_error"},
++		{name: "try_again_later", closeCode: websocket.StatusTryAgainLater, wantError: "upstream_transport_error"},
++		{name: "peer_message_too_big", closeCode: websocket.StatusMessageTooBig, wantError: "upstream_transport_error"},
++		{name: "read_limit", oversize: true, wantError: "upstream_transport_error"},
++		{name: "abrupt_after_delta", abrupt: true, wantError: "upstream_transport_error"},
++		{name: "malformed_protocol", protocolError: true, wantError: "upstream_transport_error"},
++		{name: "binary_frame", protocolError: true, binaryFrame: true, wantError: "upstream_transport_error"},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				conn, err := websocket.Accept(w, r, nil)
++				if err != nil {
++					t.Error(err)
++					return
++				}
++				defer conn.CloseNow()
++				ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
++				defer cancel()
++				if _, _, err := conn.Read(ctx); err != nil {
++					t.Error(err)
++					return
++				}
++				if err := conn.Write(ctx, websocket.MessageText, []byte(`{"type":"response.created","response":{"id":"resp_local"}}`)); err != nil {
++					t.Error(err)
++					return
++				}
++				if tc.abrupt {
++					if err := conn.Write(ctx, websocket.MessageText, []byte(`{"type":"response.output_text.delta","delta":"partial"}`)); err != nil {
++						t.Error(err)
++						return
++					}
++					conn.CloseNow()
++					return
++				}
++				if tc.oversize {
++					if err := conn.Write(ctx, websocket.MessageText, []byte(strings.Repeat("x", 8*1024*1024+1))); err != nil {
++						t.Error(err)
++					}
++					return
++				}
++				if tc.protocolError {
++					typ, payload := websocket.MessageText, []byte("private-malformed-message")
++					if tc.binaryFrame {
++						typ, payload = websocket.MessageBinary, []byte("private-binary-payload")
++					}
++					if err := conn.Write(ctx, typ, payload); err != nil {
++						t.Error(err)
++					}
++					return
++				}
++				if err := conn.Close(tc.closeCode, "private-close-reason"); err != nil {
++					t.Error(err)
++				}
++			}))
++			defer server.Close()
++
++			url := "ws" + strings.TrimPrefix(server.URL, "http")
++			conn, _, err := websocket.Dial(context.Background(), url, nil)
++			if err != nil {
++				t.Fatal(err)
++			}
++			conn.SetReadLimit(8 * 1024 * 1024)
++			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++			defer cancel()
++			reader := startCodexWSCreate(ctx, cancel, conn, []byte(`{"type":"response.create"}`))
++			body, _, _, err := aggregateCodexSSE(reader, testBridgeOpts("gpt-6-astra", "chat_1"))
++			reader.Close()
++			if err != nil {
++				t.Fatal(err)
++			}
++
++			var response map[string]any
++			if err := json.Unmarshal(body, &response); err != nil {
++				t.Fatal(err)
++			}
++			terminal := response["llms"].(map[string]any)["terminal"].(map[string]any)
++			if terminal["status"] != "interrupted" || terminal["error"].(map[string]any)["code"] != tc.wantError {
++				t.Fatalf("terminal: %s", body)
++			}
++			if tc.abrupt && terminal["transport_error_kind"] != "unexpected_eof" {
++				t.Fatalf("abrupt EOF kind: %s", body)
++			}
++			if !tc.oversize && !tc.protocolError && !tc.abrupt && terminal["websocket_close_code"] != float64(tc.closeCode) {
++				t.Fatalf("close code missing: %s", body)
++			}
++			if tc.oversize && terminal["websocket_message_too_big"] != true {
++				t.Fatalf("read-limit diagnostic missing: %s", body)
++			}
++			if !tc.oversize && terminal["websocket_message_too_big"] != nil {
++				t.Fatalf("peer close was mislabeled as local read-limit overflow: %s", body)
++			}
++			if tc.protocolError && terminal["websocket_protocol_error"] != true {
++				t.Fatalf("protocol diagnostic missing: %s", body)
++			}
++			wantLastEvent := "response.created"
++			if tc.abrupt {
++				wantLastEvent = "response.output_text.delta"
++			}
++			if terminal["last_event_type"] != wantLastEvent {
++				t.Fatalf("last event type missing: %s", body)
++			}
++			if strings.Contains(string(body), "private-close-reason") || strings.Contains(string(body), "private-malformed-message") || strings.Contains(string(body), strings.Repeat("x", 32)) {
++				t.Fatalf("private transport text leaked: %s", body)
++			}
++			if !strings.Contains(string(body), "resp_local") {
++				t.Fatalf("response id lost: %s", body)
++			}
++		})
++	}
++}
++
++func TestSafeCodexEventTypeAllowsHostedSearchProgress(t *testing.T) {
++	for _, eventType := range []string{
++		"response.web_search_call.in_progress",
++		"response.web_search_call.searching",
++		"response.web_search_call.completed",
++	} {
++		if got := safeCodexEventType(eventType); got != eventType {
++			t.Errorf("safeCodexEventType(%q) = %q", eventType, got)
++		}
++	}
++	if got := safeCodexEventType("response.web_search_call.private-payload"); got != "other" {
++		t.Errorf("unknown event type should be collapsed, got %q", got)
++	}
++}
+diff --git a/internal/store/db.go b/internal/store/db.go
+index b18b203..a051895 100644
+--- a/internal/store/db.go
++++ b/internal/store/db.go
+@@ -238,6 +238,8 @@ func parseSQLiteTime(s string) (time.Time, bool) {
+ 	layouts := []string{
+ 		time.RFC3339Nano,
+ 		time.RFC3339,
++		"2006-01-02 15:04:05.999999999 -0700 utc",
++		"2006-01-02 15:04:05.999999999 -0700 MST",
+ 		"2006-01-02 15:04:05.999999999-07:00",
+ 		"2006-01-02 15:04:05.999999999",
+ 		"2006-01-02 15:04:05",
+diff --git a/internal/store/sqlite_test.go b/internal/store/sqlite_test.go
+index 3dc841a..43a5a34 100644
+--- a/internal/store/sqlite_test.go
++++ b/internal/store/sqlite_test.go
+@@ -55,6 +55,11 @@ func TestSQLiteBootstrapLookupRouteAccount(t *testing.T) {
+ 	if err := st.AttachAccount(ctx, rt.ID, acc.ID, 0, 1); err != nil {
+ 		t.Fatalf("attach: %v", err)
+ 	}
++	quotaRemaining := 75.0
++	quotaReset := time.Date(2026, 9, 29, 20, 38, 24, 0, time.UTC)
++	if err := st.SetAccountQuotaID(ctx, acc.ID, &quotaRemaining, &quotaReset); err != nil {
++		t.Fatalf("set quota: %v", err)
++	}
+ 
+ 	pool, err := st.ListRoutePool(ctx, rt.ID)
+ 	if err != nil {
+@@ -63,6 +68,9 @@ func TestSQLiteBootstrapLookupRouteAccount(t *testing.T) {
+ 	if len(pool) != 1 || pool[0].ID != acc.ID {
+ 		t.Fatalf("pool=%v", pool)
+ 	}
++	if pool[0].QuotaResetAt == nil || !pool[0].QuotaResetAt.Equal(quotaReset) {
++		t.Fatalf("quota reset at=%v, want %v", pool[0].QuotaResetAt, quotaReset)
++	}
+ 
+ 	keyID := ac.KeyID
+ 	if err := st.InsertUsage(ctx, projectID, &rt.ID, &acc.ID, &keyID, "gpt-4o-mini", 200, 12, 3, 5, ""); err != nil {
+diff --git a/internal/store/sqlite_time_test.go b/internal/store/sqlite_time_test.go
+new file mode 100644
+index 0000000..35fa5c9
+--- /dev/null
++++ b/internal/store/sqlite_time_test.go
+@@ -0,0 +1,18 @@
++package store
++
++import (
++	"testing"
++	"time"
++)
++
++func TestFlexibleTimeScansSQLiteUTCWithLowercaseZone(t *testing.T) {
++	var got time.Time
++	err := (&flexibleTime{dest: &got}).Scan("2026-09-29 20:38:24 +0000 utc")
++	if err != nil {
++		t.Fatal(err)
++	}
++	want := time.Date(2026, 9, 29, 20, 38, 24, 0, time.UTC)
++	if !got.Equal(want) {
++		t.Fatalf("got %s, want %s", got.Format(time.RFC3339Nano), want.Format(time.RFC3339Nano))
++	}
++}

@@ -1,0 +1,25 @@
+# Same-room natural conversation
+
+The permanent sport room accepts ordinary conversation as well as current analysis. New free-text messages, including actual-entry reports, use the existing durable queue and stored context; no closed phrase list decides what the user may say. Explicit local rule commands retain their dedicated atomic RPC. Previously stored local entry acknowledgments remain replayable by owner, sport and request key.
+
+Free-text jobs use GPT-6 Astra with xhigh effort, CHAT_INSTRUCTIONS and web_search tool_choice=auto. Explicit actions use the existing analysis instructions and required search; only check_status uses medium effort. There is one gateway invocation per attempt and no paid fallback. The exact chosen instructions are saved and hashed before execution.
+
+Every model free-text reply ends in one strict response-purpose envelope: version=1; intent=conversation/current_analysis/mixed/clarification; basis=general/stored_context/fresh_web; referenced_message_ids; requires_fresh_data. Stored-context references must be actual recent message IDs in the snapshot. Current_analysis and mixed require fresh_web and requires_fresh_data=true. Conversation and clarification require false. The server strips the envelope before presentation or analysis extraction.
+
+Conversation completion uses finalize_gateway_conversation_job with the existing finalizer's six arguments. It saves only a conversation message, truthful upstream audit and job result_type=conversation. It does not extract coverage or records and cannot create events, recommendations, bets or criteria. Model instructions prohibit claims that those records were changed. A conversation may include actual sourced general explanation and still remain a conversation.
+
+Malformed, missing, contradictory or untraceable envelopes receive a fixed server clarification. Conversation-labeled analysis envelopes also receive this clarification. Original responses remain in audit metadata; arbitrary model analysis data never reaches extraction from these branches. A valid current/mixed reply must pass the existing verified/searched/nonempty-source requirements. A conservative request guard additionally recognizes unmistakable current sports commands so a conversation label cannot downgrade fresh verification. Questions about previous PASS judgments or failed analysis work do not trigger the guard. Explicit analysis actions cannot become conversation.
+
+The database independently enforces conversation shape and attempt/worker/lease fencing. Existing analysis finalization remains strict and records result_type=analysis. Latest analysis selection and completed-analysis notices ignore conversation jobs, while legacy completed NULL result types remain analyses. Chat renders conversation without coverage or verification-failure banners.
+
+Acceptance evidence consists of varied ordinary conversation, historical discussion, corrections and entry reports completing without invented search; mixed/current requests requiring sources; strict actions retaining verification; invalid envelopes and fake IDs producing no-write clarification; real raw responses and chosen prompt hashes remaining auditable; stale and duplicate finalization remaining fenced; historic local-key replay; and conversation completions leaving the latest analysis unchanged.
+
+## Verified outcome — October 1, 2026
+
+The deployed room completed a live Korean question asking for the difference between WATCH and BET in the saved WNBA criteria. The first attempt saved one natural assistant reply as result_type=conversation with a valid stored_context purpose and three validated historical message references. Its audit retained searched=false, verified=false and an empty source list. The UI displayed FIELDNOTE without a verification-failure banner. A fresh UI reload confirmed the reply remained saved and the prior latest-analysis region stayed unchanged. Local screenshot evidence was captured and visually inspected.
+
+The live check left existing bets, events, recommendations and criteria unchanged and preserved the prior latest WNBA analysis. It used one OpenLLMs subscription call and no paid API fallback. The web and worker deployments succeeded and each had one running instance with none crashed. The pinned gateway preserved auto search selection without forcing a required search.
+
+Unit and route verification passed 357 tests across 37 suites. TypeScript, lint and the production Next build passed. The new migration and all seven SQL fixtures passed inside a rolled-back transaction, with no residual schema or fixture rows from the gate; the production migration subsequently committed. Review findings about unsupported fresh-web claims, current question forms and forbidden block variants were resolved and covered by regressions.
+
+This check verifies ordinary conversation and persistence boundaries. A current sports-analysis request was not rerun after deployment, so the overall analysis failure rate after the fix remains unmeasured.

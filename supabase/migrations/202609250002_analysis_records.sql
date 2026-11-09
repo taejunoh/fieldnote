@@ -1,0 +1,152 @@
+-- Finalize the answer and its explicitly validated analysis record in one transaction.
+alter table public.recommendations
+  add column recommendation_item_key text,
+  add column source_message_id uuid;
+alter table public.recommendations
+  add constraint recommendations_source_message_owner_fk
+  foreign key (source_message_id, owner_id) references public.messages(id, owner_id);
+create unique index recommendations_gateway_item_unique
+  on public.recommendations (analysis_job_id, recommendation_item_key)
+  where analysis_job_id is not null and recommendation_item_key is not null;
+
+create or replace function public.finalize_gateway_job(
+  p_job_id uuid, p_attempt_id uuid, p_worker_id text,
+  p_content text, p_metadata jsonb default '{}'::jsonb,
+  p_provider_response_id text default null
+) returns uuid language plpgsql security invoker set search_path = public as $$
+declare
+  v_job public.analysis_jobs%rowtype;
+  v_attempt public.analysis_attempts%rowtype;
+  v_message uuid;
+  v_event_id uuid;
+  v_events jsonb := '{}'::jsonb;
+  v_items jsonb := '{}'::jsonb;
+  v_record jsonb := p_metadata->'analysis_record';
+  v_event jsonb;
+  v_recommendation jsonb;
+  v_sport text;
+  v_now timestamptz := clock_timestamp();
+begin
+  if auth.role() <> 'service_role' then raise exception 'Service role required' using errcode = '42501'; end if;
+  if p_metadata->>'terminalStatus' is distinct from 'completed'
+    or p_metadata->>'verified' is distinct from 'true' then
+    raise exception 'Only verified completed gateway results may be finalized';
+  end if;
+  if nullif(btrim(p_content), '') is null then raise exception 'Assistant content required'; end if;
+
+  select * into v_job from public.analysis_jobs where id = p_job_id for update;
+  if not found or v_job.provider <> 'openllms' or v_job.status <> 'running'
+    or v_job.current_attempt_id is distinct from p_attempt_id
+    or v_job.lease_owner is distinct from p_worker_id or v_job.lease_expires_at <= v_now then
+    raise exception 'Stale or expired gateway attempt' using errcode = '55000';
+  end if;
+  select * into v_attempt from public.analysis_attempts
+    where id = p_attempt_id and job_id = p_job_id and status = 'running' for update;
+  if not found or v_attempt.execution_started_at is null then
+    raise exception 'Gateway execution was not marked started' using errcode = '55000';
+  end if;
+
+  if v_record is not null then
+    select slug into v_sport from public.sports where id = v_job.sport_id and owner_id = v_job.owner_id;
+    if jsonb_typeof(v_record) is distinct from 'object' or v_record->>'version' is distinct from '1'
+      or v_record->>'sport' is distinct from v_sport
+      or jsonb_typeof(v_record->'events') is distinct from 'array'
+      or jsonb_typeof(v_record->'recommendations') is distinct from 'array'
+      or jsonb_typeof(p_metadata->'sources') is distinct from 'array'
+      or nullif(p_metadata->>'checked_at', '') is null then
+      raise exception 'Invalid analysis record' using errcode = '22023';
+    end if;
+    if jsonb_array_length(v_record->'events') > 20
+      or jsonb_array_length(v_record->'recommendations') > 20 then
+      raise exception 'Analysis record exceeds item limit' using errcode = '22023';
+    end if;
+  end if;
+
+  insert into public.messages(owner_id, sport_id, role, content, metadata, analysis_job_id)
+    values(v_job.owner_id, v_job.sport_id, 'assistant', p_content, p_metadata, p_job_id)
+    on conflict (analysis_job_id, role) do nothing returning id into v_message;
+  if v_message is null then
+    raise exception 'Assistant message already exists for this job' using errcode = '23505';
+  end if;
+
+  if v_record is not null then
+    for v_event in select value from jsonb_array_elements(v_record->'events') loop
+      if jsonb_typeof(v_event) <> 'object'
+        or v_event->>'event_key' !~ ('^' || v_sport || ':[0-9]{4}-[0-9]{2}-[0-9]{2}:[a-z0-9][a-z0-9-]+@[a-z0-9][a-z0-9-]+:id-[a-z0-9]{3,40}$')
+        or nullif(btrim(v_event->>'label'), '') is null
+        or v_event->>'analysis_status' is null
+        or v_event->>'analysis_status' not in ('WATCH','WAIT','BET','PASS','PAPER','EVALUATION INCOMPLETE')
+        or v_events ? (v_event->>'event_key')
+        or not exists (select 1 from jsonb_array_elements(p_metadata->'sources') as s
+          where s->>'url' = v_event->>'source_url') then
+        raise exception 'Invalid sourced event' using errcode = '22023';
+      end if;
+      if v_event->>'analysis_status' = 'BET' and
+        (nullif(v_event->>'starts_at', '') is null
+          or (v_event->>'starts_at')::timestamptz <= (p_metadata->>'checked_at')::timestamptz) then
+        raise exception 'BET event requires a future start' using errcode = '22023';
+      end if;
+      insert into public.events(owner_id, sport_id, event_key, label, starts_at, source_ref, analysis_status)
+        values(v_job.owner_id, v_job.sport_id, v_event->>'event_key',
+          v_event->>'label', (v_event->>'starts_at')::timestamptz,
+          v_event->>'source_url', v_event->>'analysis_status')
+        on conflict (owner_id, sport_id, event_key) do update set
+          label = excluded.label,
+          starts_at = coalesce(public.events.starts_at, excluded.starts_at),
+          source_ref = excluded.source_ref,
+          updated_at = v_now
+        returning id into v_event_id;
+      v_events := jsonb_set(v_events, array[v_event->>'event_key'], to_jsonb(v_event_id::text));
+    end loop;
+
+    for v_recommendation in select value from jsonb_array_elements(v_record->'recommendations') loop
+      v_event_id := (v_events->>(v_recommendation->>'event_key'))::uuid;
+      if v_event_id is null
+        or v_recommendation->>'item_key' !~ '^[a-z0-9][a-z0-9_-]{0,39}$'
+        or v_items ? (v_recommendation->>'item_key')
+        or nullif(btrim(v_recommendation->>'market'), '') is null
+        or nullif(btrim(v_recommendation->>'selection'), '') is null
+        or v_recommendation->>'decision' is null
+        or v_recommendation->>'decision' not in ('WATCH','WAIT','BET','PASS','PAPER','EVALUATION INCOMPLETE') then
+        raise exception 'Invalid recommendation' using errcode = '22023';
+      end if;
+      if v_recommendation->>'decision' = 'BET' and not exists (
+        select 1 from jsonb_array_elements(v_record->'events') as e
+          where e->>'event_key' = v_recommendation->>'event_key'
+            and nullif(e->>'starts_at', '') is not null
+            and (e->>'starts_at')::timestamptz > (p_metadata->>'checked_at')::timestamptz
+      ) then
+        raise exception 'BET recommendation requires a future start' using errcode = '22023';
+      end if;
+      insert into public.recommendations(
+        owner_id, sport_id, event_id, market, selection, decision,
+        suggested_units, price_gate, analysis_job_id, recommendation_item_key,
+        source_message_id, source_ref
+      ) values (
+        v_job.owner_id, v_job.sport_id, v_event_id,
+        v_recommendation->>'market', v_recommendation->>'selection',
+        v_recommendation->>'decision',
+        (v_recommendation->>'suggested_units')::numeric,
+        v_recommendation->>'price_gate', p_job_id,
+        v_recommendation->>'item_key', v_message,
+        (select source_ref from public.events where id = v_event_id)
+      ) on conflict (analysis_job_id, recommendation_item_key) where analysis_job_id is not null and recommendation_item_key is not null do nothing;
+      v_items := jsonb_set(v_items, array[v_recommendation->>'item_key'], 'true'::jsonb);
+    end loop;
+  end if;
+
+  update public.analysis_attempts set
+    status = 'completed', finished_at = v_now,
+    provider_response_id = p_provider_response_id,
+    usage = coalesce(p_metadata->'usage', '{}'::jsonb),
+    sources = coalesce(p_metadata->'sources', '[]'::jsonb),
+    provider_metadata = p_metadata
+  where id = p_attempt_id;
+  update public.analysis_jobs set
+    status = 'completed', response_id = p_provider_response_id,
+    result_message_id = v_message, error = null,
+    lease_owner = null, lease_expires_at = null,
+    provider_metadata = p_metadata, updated_at = v_now
+  where id = p_job_id;
+  return v_message;
+end $$;

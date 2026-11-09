@@ -1,0 +1,20 @@
+services:
+  openllms:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      HTTP_ADDR: "0.0.0.0:8080"
+      DATABASE_URL: "sqlite:/data/llms.db"
+      LLMS_SECRETS_DIR: "/data/secrets"
+      OPENLLMS_CODEX_TRANSPORT: "${OPENLLMS_CODEX_TRANSPORT:-http}"
+      OPENLLMS_UPSTREAM_TIMEOUT_SECONDS: "${OPENLLMS_UPSTREAM_TIMEOUT_SECONDS:-2700}"
+      BOOTSTRAP_TOKEN: "${OPENLLMS_BOOTSTRAP_TOKEN?Set a random OPENLLMS_BOOTSTRAP_TOKEN before starting the gateway}"
+    volumes:
+      - openllms-data:/data
+    restart: unless-stopped
+
+volumes:
+  openllms-data:

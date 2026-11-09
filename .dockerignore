@@ -1,0 +1,21 @@
+.git
+.next
+node_modules
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+**/secrets
+**/*.dump
+**/*.db
+**/*.db-*
+**/*.tar.gz
+supabase/.temp
+supabase/.branches
+*.tsbuildinfo
+deploy-secrets
+backups
+
+# Optional reviewed runtime data is copied only in a private release staging directory.
+private-display-candidates.json

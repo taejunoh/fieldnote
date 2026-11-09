@@ -1,0 +1,10 @@
+# Reference only: current Railway rejects legacy Config as Code; apply these values through service settings.
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "deploy/Dockerfile"
+
+[deploy]
+numReplicas = 1
+sleepApplication = false
+healthcheckPath = "/"
+restartPolicyType = "ALWAYS"

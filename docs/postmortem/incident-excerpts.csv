@@ -1,0 +1,9 @@
+date_et,sport,stage,observed_signal,evidence_limit
+2026-10-20,all,railway_deploy,UPLOAD_FAILED / Deploys have been paused temporarily,배포 제한 원인 미확인
+2026-10-23,nhl,transport,transport_started / heartbeat 갱신 / 9분 이상 정체,업스트림에서 응답이 지연된 정확한 원인 미확인
+2026-10-23,nhl,persistence,추천의 event_key가 일정 레코드와 연결되지 않음,연결 중단과 별개
+2026-10-23,tennis,coverage,독립 일정 검증 불가 / 평가 누락 18건,전체 일정 확인을 뜻하지 않음
+2026-10-29,cfb+wnba,persistence,evaluation_report_absent,두 원문 응답은 보존
+2026-10-29,nba+nfl+nhl+soccer,persistence,evaluation_invalid_schema,네 원문 응답은 보존
+2026-10-29,tennis,persistence,evaluation_unknown_source,출처 URL과 응답 참조 불일치 / 원문은 보존
+2026-10-30,all,status_rollout,DB 읽기 HTTP 522,새 상태 조회의 웹·작업자 배포 보류

@@ -1,0 +1,18 @@
+node_modules
+.next
+.env*
+!.env.example
+gateway/.codex-pending.json
+gateway/.codex-account-id
+*.tsbuildinfo
+coverage
+supabase/.temp/
+# Fieldnote local verification and private display candidates
+verification/
+private-display-candidates.json
+
+# Runtime credentials and local agent state
+gateway/.env.admin
+gateway/.codex*
+runtimeauthgateway/.codex*
+supabase/.branches/
