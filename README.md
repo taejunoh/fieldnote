@@ -1,6 +1,6 @@
 # Fieldnote
 
-이 저장소는 중단된 Fieldnote 프로젝트의 보관본입니다. [운영 종료 보고서](docs/fieldnote-postmortem.md)와 [집계 근거 및 재현 방법](docs/postmortem/README.md)을 확인하세요. 아래 설치·운영 지침은 보관된 당시 문서입니다.
+이 저장소는 중단된 Fieldnote 프로젝트의 보관본입니다. [운영 종료 보고서](docs/fieldnote-postmortem.md), [English postmortem](docs/fieldnote-postmortem.en.md), [집계 근거 및 재현 방법](docs/postmortem/README.md)을 확인하세요. 아래 설치·운영 지침은 보관된 당시 문서입니다.
 
 개인용 종목별 지속 대화와 스포츠 분석 기록 앱입니다. MLB handoff MD를 가져와 검토한 뒤, 같은 대화에서 검색 기반 분석을 이어갑니다.
 
