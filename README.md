@@ -39,7 +39,9 @@ The useful reliability measure was how often the first request put a complete, u
 
 ## Local setup
 
-These instructions document how to run the preserved source locally. You need Node.js 20 or later, Docker, and the Supabase CLI.
+The archived dependency versions have known security advisories. Use this setup on localhost and review and update dependencies before any redeployment.
+
+These instructions document how to run the preserved source locally. Use Node.js 22 (22.13 or later), Docker, and the Supabase CLI. Set `enable_signup = false` under `[auth]` in `supabase/config.toml` before starting the local stack.
 
 ```sh
 npm ci
@@ -48,7 +50,7 @@ supabase migration up --local
 cp .env.example .env.local
 ```
 
-Set `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, and `OWNER_EMAIL` in `.env.local`. Enable email OTP for the owner, allow `http://localhost:3000/auth/callback` as an Auth redirect, and disable public signups. Keep credentials in your local environment file.
+Set `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, and `OWNER_EMAIL` in `.env.local`. Get the local API URL and keys from `supabase status`. In local Supabase Studio, create and confirm one Auth user with a password and the same email as `OWNER_EMAIL`. Sign in to Fieldnote with that email and password. Keep credentials in your local environment file.
 
 Follow the [gateway setup guide](gateway/README.md) to build and start openllms, connect a Codex account, and create a route. Set `OPENLLMS_API_KEY` to the route key and `OPENLLMS_BASE_URL` to the route URL ending in `/v1`.
 

@@ -39,7 +39,9 @@ Supabase Postgres ──▶ 백그라운드 작업자 ──▶ openllms 게이�
 
 ## 로컬 준비
 
-보관된 소스를 로컬에서 실행하는 방법입니다. Node.js 20 이상, Docker, Supabase CLI가 필요합니다.
+보관본의 의존성 버전에는 알려진 보안 취약점이 있습니다. 이 절차는 로컬에서 사용하고, 다시 배포하려면 먼저 의존성을 검토하고 업데이트하세요.
+
+보관된 소스를 로컬에서 실행하는 방법입니다. Node.js 22(22.13 이상), Docker, Supabase CLI가 필요합니다. 로컬 서비스를 시작하기 전에 `supabase/config.toml`의 `[auth]`에서 `enable_signup = false`로 설정합니다.
 
 ```sh
 npm ci
@@ -48,7 +50,7 @@ supabase migration up --local
 cp .env.example .env.local
 ```
 
-`.env.local`에 `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, `OWNER_EMAIL`을 설정합니다. Supabase Auth에서 소유자 이메일 OTP를 켜고 `http://localhost:3000/auth/callback`을 리디렉션 URL로 허용한 뒤 공개 가입을 끕니다. 자격증명은 로컬 환경 파일에 보관합니다.
+`.env.local`에 `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, `OWNER_EMAIL`을 설정합니다. `supabase status`에서 로컬 API 주소와 키를 확인합니다. 로컬 Supabase Studio에서 `OWNER_EMAIL`과 같은 이메일로 Auth 사용자 한 명을 만들고, 비밀번호를 설정한 뒤 이메일을 확인 처리합니다. Fieldnote에서 이 이메일과 비밀번호로 로그인합니다. 자격증명은 로컬 환경 파일에 보관합니다.
 
 [게이트웨이 설정 안내](gateway/README.ko.md)에 따라 openllms를 빌드·실행하고 Codex 계정을 연결해 라우트를 만듭니다. 라우트 키를 `OPENLLMS_API_KEY`로, `/v1`로 끝나는 라우트 주소를 `OPENLLMS_BASE_URL`로 설정합니다.
 

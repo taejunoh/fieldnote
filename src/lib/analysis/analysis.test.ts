@@ -22,9 +22,9 @@ describe("gateway analysis settings", () => {
     vi.stubEnv("OPENLLMS_EFFORT_RECHECK", "");
     vi.stubEnv("OPENLLMS_EFFORT_STATUS", "");
     vi.stubEnv("OPENAI_MODEL", "gpt-6-sol");
-    vi.stubEnv("OPENAI_EFFORT_RECHECK", "high");
+    vi.stubEnv("OPENAI_EFFORT_RECHECK", "xhigh");
     vi.stubEnv("OPENAI_EFFORT_STATUS", "low");
-    expect(analysisSettings("recheck_lineup")).toEqual({ model: "gpt-6-astra", effort: "xhigh" });
+    expect(analysisSettings("recheck_lineup")).toEqual({ model: "gpt-6-astra", effort: "high" });
     expect(analysisSettings("check_status")).toEqual({ model: "gpt-6-astra", effort: "medium" });
   });
 });

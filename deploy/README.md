@@ -1,6 +1,6 @@
 # Managed Supabase and Railway deployment
 
-Status: Railway services have been provisioned in the dedicated AllinSimple Edge Hobby workspace. Web, gateway, and worker are deployed. Server Codex authorization and the app search adapter are verified. Production URL: https://web-production-4e33a.up.railway.app. Workspace soft alert is $8 and compute hard stop is $10.
+Fieldnote is retired. The deployment steps and verification notes below describe the former production setup. See the [operations postmortem](../docs/fieldnote-postmortem.en.md#7-hosting-shutdown-and-backup-verification) for the final hosting and backup status.
 
 Use the existing managed Supabase `allinsimple-edge` project. Deploy three separate Railway services in one project:
 
