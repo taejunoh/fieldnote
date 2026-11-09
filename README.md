@@ -7,7 +7,7 @@ Fieldnote was a personal sports analysis app with a persistent conversation and 
 **Project status: retired.** The Railway deployments were stopped, the Hobby subscription was canceled, and the Supabase project was paused. On the development Mac, login startup was disabled and the local web app and analysis worker were stopped. This repository preserves the application source and the de-identified evidence behind the postmortem. Verified database and gateway backups are stored separately in restricted local storage.
 
 - [Operations postmortem](docs/fieldnote-postmortem.en.md)
-- [운영 종료 보고서](docs/fieldnote-postmortem.md)
+- [Operations postmortem (Korean)](docs/fieldnote-postmortem.md)
 - [Evidence and reproduction guide](docs/postmortem/README.md)
 
 ## Architecture
