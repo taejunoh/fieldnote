@@ -6,7 +6,8 @@ Fieldnote was a personal app built to preserve the context of sports analysis an
 
 - **Confirmed bets** — Fieldnote recorded 6 bets confirmed directly in the app. They finished 2–4 on 2.75U risked, for −0.7891U and an ROI of −28.69%. The sample spans four sports. Relative performance against ChatGPT under matched conditions remains unverified.
 - **Reliability** — Of 423 recorded requests, 405 were complete, 7 failed, and 11 ended in an interrupted state. In a separate seven-sport audit, all seven raw responses were available, but the structured results initially failed the requirements for publication in the analysis tables.
-- **State at closeout** — Astra · High was the production analysis default. The status-check change that split direct API lookups from Luna · Low extraction reached the database and gateway. The web and worker releases were deferred.
+- **Deployment state before shutdown** — Astra · High was the production analysis default. The status-check change that split direct API lookups from Luna · Low extraction reached the database and gateway. The web and worker releases were deferred.
+- **Hosting shutdown** — On November 9, the production database and gateway backups were verified before the three Railway deployments were stopped and the Hobby subscription was canceled. The Supabase Free project was paused.
 
 [한국어 보고서](fieldnote-postmortem.md)
 
@@ -78,9 +79,37 @@ Input accounted for most of the recorded tokens in both batches. Experiments tha
 
 ## 6. State at closeout and lessons
 
-- **In production** — GPT-6 Astra · High was the default for evaluations and reevaluations. The October 30 web and worker deployments were still the latest successful deployments at the November 9 readback. Simple status checks used the existing Astra · Medium route.
+- **Production settings before shutdown** — GPT-6 Astra · High was the default for evaluations and reevaluations. The November 9 check before shutdown identified the October 30 web and worker deployments as the last successful deployments. Simple status checks used the existing Astra · Medium route.
 - **Partially released** — Direct API lookups, Luna · Low extraction from web material, and explicit Astra · High reevaluation were verified locally. The database and gateway changes shipped. The web and worker changes remained undeployed. Production extraction quality and usage savings remain unverified.
 - **What was worth preserving** — Persistent records and evaluation rules by sport, separation of recommendations from confirmed bets, and retention of raw responses. The consolidated table was useful when it showed accurate conditions and sources and let the user find the result quickly.
 - **Criteria for revisiting the project** — Compare analyses using the same pregame inputs and price snapshots. Measure how often the first request produces a usable published result, how often table rows are missing, time to recovery, and usage per request. Evaluate actual performance on comparable periods with confirmed bets and settlements.
 
 The repository contains an archive of the last production web and worker source, reproducible aggregates, and de-identified bet and incident excerpts. The original ledgers, conversations, and private logs in full are outside the scope of this repository. The archive omits a one-off repair script tied to production targets and redacts private paths and identifiers in operational notes. Production record identifiers in the historical recovery path and its test were replaced with matching synthetic values. [Evidence and reproduction guide](postmortem/README.md)
+
+## 7. Hosting shutdown and backup verification
+
+**Final verification November 9, 2026 at 11:36 a.m. ET**
+
+| Item | Verified outcome |
+|---|---|
+| Railway deployments | The web, worker, and gateway deployments were stopped. Railway reported `REMOVED` for all three, and the production web URL returned HTTP 404. |
+| Railway volume | After backup verification, the gateway volume was detached and queued for deletion. Deletion was pending at the final check and scheduled for **November 11, 2026**. |
+| Railway Hobby | Cancellation was confirmed for the AllinSimple Edge workspace. The subscription ends on **November 26, 2026**. Previously accrued usage may appear on the final invoice. The final amount remains unverified. |
+| Supabase | The Free project was paused. The dashboard showed it as paused, and the CLI reported `INACTIVE`. The dashboard lists **December 14, 2027** as the deadline to resume the project. |
+
+Before shutdown, an **81,304,960-byte** dump of the production database was saved. The archive contained schemas and data, including Auth and Storage, and was restored into an isolated Supabase PostgreSQL **17.6.1.166** instance. The restore completed without errors, and the counts below matched between production and the restored copy.
+
+| Record type | Production | Isolated restore |
+|---|---:|---:|
+| Messages | 861 | 861 |
+| Analysis jobs | 423 | 423 |
+| Ledger rows | 154 | 154 |
+| Postgame review notes | 172 | 172 |
+| Queued or running analysis jobs | 0 | 0 |
+| Auth users | 1 | 1 |
+| Storage buckets | 0 | 0 |
+| Storage objects | 0 | 0 |
+
+The gateway backup separately preserved **four volume files** containing SQLite data and secret configuration. Each file's SHA-256 matched its source, and the copied SQLite database returned `ok` on its integrity check. The database dump, gateway backup, and verification receipts are kept in access-restricted local storage.
+
+The restore check covered the database schema and data. Bringing the service back online requires separately applying global roles, object ownership and grants, and the Supabase project and authentication settings.
