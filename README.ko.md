@@ -8,7 +8,7 @@ Fieldnote는 종목마다 하나의 지속 대화와 베팅 장부를 제공한 
 
 - [운영 종료 보고서](docs/fieldnote-postmortem.md)
 - [English postmortem](docs/fieldnote-postmortem.en.md)
-- [집계 근거 및 재현 방법](docs/postmortem/README.md)
+- [집계 근거 및 재현 방법](docs/postmortem/README.ko.md)
 
 ## 아키텍처
 
